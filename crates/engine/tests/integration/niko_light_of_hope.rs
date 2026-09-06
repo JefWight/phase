@@ -468,6 +468,58 @@ fn f_single_subject_recipient_selfref_omitted_from_json() {
     );
 }
 
+// ── (g) Deserialization normalizes a context-ref `Target` ─────────────────
+//
+// CR 115.1 + CR 608.2k: `CopyRecipient::announced_filter` is unconditional for
+// `Target`, because six authorities (both slot builders, both target assigners,
+// the chain target-sink predicate, and the resolver's copy-source index) must
+// agree on whether slot 0 is the recipient. The parser can never emit a
+// context-ref `Target`, but `Deserialize` is a second entry point: a hand-edited
+// or corrupted mid-resolution snapshot could otherwise introduce
+// `Target(TriggeringSource)`, which announces a slot for an object no player
+// chooses and collapses the recipient onto the copy source.
+#[test]
+fn g_deserializing_a_context_ref_target_recipient_normalizes_to_untargeted() {
+    use engine::types::ability::CopyRecipient;
+
+    // Reach guard: the ordinary announced shape survives deserialization
+    // unchanged, so the normalization below cannot pass by flattening
+    // everything to `Untargeted`.
+    let announced: Effect = serde_json::from_str(
+        r#"{"type":"BecomeCopy","target":{"type":"Any"},
+            "recipient":{"type":"Target","filter":{"type":"Typed","type_filters":["Artifact"],"controller":"You","properties":[]}}}"#,
+    )
+    .expect("announced recipient must deserialize");
+    let Effect::BecomeCopy { recipient, .. } = &announced else {
+        panic!("expected BecomeCopy, got {announced:?}");
+    };
+    assert!(
+        matches!(recipient, CopyRecipient::Target(_)),
+        "a non-context-ref Target must stay announced, got {recipient:?}"
+    );
+    assert!(recipient.announced_filter().is_some());
+
+    // THE DISCRIMINATING ROW: a context ref in the announced position is
+    // normalized on the way in, so no consumer ever sees it.
+    let corrupted: Effect = serde_json::from_str(
+        r#"{"type":"BecomeCopy","target":{"type":"Any"},
+            "recipient":{"type":"Target","filter":{"type":"TriggeringSource"}}}"#,
+    )
+    .expect("context-ref recipient must still deserialize");
+    let Effect::BecomeCopy { recipient, .. } = &corrupted else {
+        panic!("expected BecomeCopy, got {corrupted:?}");
+    };
+    assert_eq!(
+        *recipient,
+        CopyRecipient::Untargeted(TargetFilter::TriggeringSource),
+        "a context-ref Target must normalize to Untargeted on deserialization"
+    );
+    assert!(
+        recipient.announced_filter().is_none(),
+        "a normalized context ref must announce no target slot"
+    );
+}
+
 /// Collect every `BecomeCopy` effect across a card's abilities and triggers.
 fn all_become_copies(parsed: &engine::parser::oracle::ParsedAbilities) -> Vec<Effect> {
     let mut out = Vec::new();

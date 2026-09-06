@@ -33,6 +33,9 @@ pub fn resolve(
                 .unwrap_or(Duration::Permanent),
             additional_modifications.clone(),
         ),
+        // CR 707.2: a non-`BecomeCopy` effect reaching this resolver has no
+        // recipient axis of its own, so the copy lands on the ability's own
+        // source — the same default `CopyRecipient::Source` encodes.
         _ => (
             crate::types::ability::CopyRecipient::Source,
             ability.duration.clone().unwrap_or(Duration::Permanent),
@@ -299,8 +302,10 @@ fn apply_copy_values_to_recipients(
         }
         // CR 115.1: an announced recipient — the FIRST declared object target
         // (the copy source is the second; see `resolve`). Read straight off the
-        // chosen targets rather than re-evaluating the filter, so CR 608.2b
-        // legality is whatever was locked in at announcement.
+        // chosen targets rather than re-evaluating the filter: CR 115.1 fixes
+        // the chosen objects at announcement, and the resolution-time legality
+        // recheck (CR 608.2b) is the skip guard in the loop below, not a
+        // re-selection.
         crate::types::ability::CopyRecipient::Target(_) => ability
             .targets
             .iter()
@@ -333,9 +338,13 @@ fn apply_copy_values_to_recipients(
         }
     };
     for id in recipient_ids {
-        // CR 608.2b: a recipient that left the battlefield between announcement
-        // and resolution is simply skipped — the rest of the effect still
-        // happens.
+        // CR 608.2b (announced recipient) / CR 611.2c (untargeted set): a
+        // recipient that is no longer on the battlefield at resolution is
+        // skipped and the rest of the effect still happens. The two readings
+        // reach the same action by different routes — a `Target` recipient is a
+        // target whose legality is rechecked on resolution (608.2b), while an
+        // `Untargeted` recipient is never a target at all and simply is not
+        // among the objects the locked set can still affect (611.2c).
         if !state.objects.contains_key(&id) {
             continue;
         }

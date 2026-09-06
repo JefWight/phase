@@ -13646,8 +13646,9 @@ pub enum CopyManaValueLimit {
 ///
 /// - Shuri, Wakandan Inventor — "**Target** artifact you control becomes a copy
 ///   of a second target artifact you control" — recipient `Typed(Artifact, You)`,
-///   **announced** (CR 115.1: it takes a target slot, and CR 115.6 shroud /
-///   CR 115.4 legality apply to it).
+///   **announced** (CR 115.1: declared as the ability is put on the stack, so it
+///   takes a target slot and is rechecked for legality on resolution per
+///   CR 608.2b).
 /// - Mirrorweave — "**Each other** creature becomes a copy of target
 ///   nonlegendary creature" — recipient `Typed(Creature, [Other])`, **not
 ///   announced**; the set is determined as the spell resolves (CR 611.2c).
@@ -13690,14 +13691,14 @@ impl CopyRecipient {
     /// CR 115.1: the filter that is ANNOUNCED as a target slot, if any.
     ///
     /// `Target` is *defined* as the announced reading, so this is unconditional
-    /// for that variant. Three authorities key off this one function — the slot
-    /// builder, the copy-source target index, and the resolver's recipient read
-    /// — and they are only consistent if all three agree on whether slot 0 is
-    /// the recipient. A predicate that could decline a `Target` here (e.g. a
-    /// context-ref guard) would silently collapse the recipient and the copy
-    /// source onto the same declared object, so the context-ref case is instead
-    /// excluded at construction, in
-    /// `oracle_effect::subject::copy_recipient_for_application`.
+    /// for that variant. Six authorities key off this one function — both slot
+    /// builders, both target assigners, the chain target-sink predicate, and
+    /// the resolver's copy-source index — and they are consistent only if all
+    /// six agree on whether slot 0 is the recipient. A predicate that could
+    /// decline a `Target` here (e.g. a context-ref guard) would silently
+    /// collapse the recipient and the copy source onto the same declared
+    /// object, so the context-ref case is excluded by [`Self::targeted`]
+    /// instead — at construction and on deserialization, never here.
     pub fn announced_filter(&self) -> Option<&TargetFilter> {
         match self {
             CopyRecipient::Target(filter) => Some(filter),
@@ -13705,13 +13706,43 @@ impl CopyRecipient {
         }
     }
 
-    fn is_source(&self) -> bool {
+    /// CR 115.1 + CR 608.2k: build the recipient for a DECLARED-target subject,
+    /// routing a context ref to [`Self::Untargeted`].
+    ///
+    /// A context ref (`SelfRef`, `TriggeringSource`, `ParentTarget`, …) resolves
+    /// from chain or event context rather than a player's announcement, so it
+    /// can never occupy a target slot. This constructor is the single place that
+    /// decision is made, which is what lets [`Self::announced_filter`] stay
+    /// unconditional; see its doc for why a guard there would be wrong.
+    pub fn targeted(filter: TargetFilter) -> Self {
+        if filter.is_context_ref() {
+            CopyRecipient::Untargeted(filter)
+        } else {
+            CopyRecipient::Target(filter)
+        }
+    }
+
+    pub fn is_source(&self) -> bool {
         matches!(self, CopyRecipient::Source)
     }
 }
 
-fn copy_recipient_is_source(recipient: &CopyRecipient) -> bool {
-    recipient.is_source()
+/// CR 115.1: re-apply [`CopyRecipient::targeted`]'s invariant on the way in.
+///
+/// The parser can never emit a context-ref `Target`, but `Deserialize` is a
+/// second entry point: a hand-edited or corrupted mid-resolution snapshot could
+/// otherwise introduce `Target(TriggeringSource)`, which would collapse the
+/// recipient and the copy source onto one declared object across all six
+/// authorities. Normalizing here keeps the invariant a property of the type
+/// rather than of one construction site.
+fn deserialize_copy_recipient<'de, D>(deserializer: D) -> Result<CopyRecipient, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match CopyRecipient::deserialize(deserializer)? {
+        CopyRecipient::Target(filter) => CopyRecipient::targeted(filter),
+        other => other,
+    })
 }
 
 /// CR 702.179c-d: Direction of a speed change. Typed (not a bool) so the
@@ -15339,7 +15370,11 @@ pub enum Effect {
         /// Polymorph); `Untargeted(..)` is a resolution-time recipient set
         /// (Mirrorweave, Niko's "Shards you control", Assimilation Aegis'
         /// attached host). See [`CopyRecipient`].
-        #[serde(default, skip_serializing_if = "copy_recipient_is_source")]
+        #[serde(
+            default,
+            skip_serializing_if = "CopyRecipient::is_source",
+            deserialize_with = "deserialize_copy_recipient"
+        )]
         recipient: CopyRecipient,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration: Option<Duration>,

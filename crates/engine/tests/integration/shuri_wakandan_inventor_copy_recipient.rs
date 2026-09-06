@@ -29,8 +29,10 @@
 //!   - CR 707.2: a copy acquires the copiable values of the original.
 
 use engine::game::scenario::{GameScenario, P0};
-use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::{ControllerRef, CopyRecipient, Effect, TargetFilter, TypeFilter};
+use engine::parser::oracle::{parse_oracle_text, ParsedAbilities};
+use engine::types::ability::{
+    AbilityDefinition, ControllerRef, CopyRecipient, Effect, TargetFilter, TypeFilter,
+};
 use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::WaitingFor;
@@ -52,6 +54,13 @@ fn shuri_copy_effect() -> Effect {
         &["Creature".to_string()],
         &[],
     );
+    // Reach guard: the whole card must parse, so a later assertion about the
+    // recipient cannot pass merely because some upstream clause bailed out.
+    // Shuri's cost-reduction static and the "Activate only as a sorcery"
+    // restriction share this card, and a regression that dropped the activated
+    // ability entirely would otherwise surface as a confusing `expect` panic
+    // rather than an honest "this clause is an unimplemented gap".
+    assert_no_unimplemented(&parsed);
     (*parsed
         .abilities
         .iter()
@@ -59,6 +68,38 @@ fn shuri_copy_effect() -> Effect {
         .expect("Shuri must parse a BecomeCopy activated ability")
         .effect)
         .clone()
+}
+
+/// Every effect reachable from a parsed card, including chained sub-abilities.
+fn all_effects(parsed: &ParsedAbilities) -> Vec<Effect> {
+    fn walk(def: &AbilityDefinition, out: &mut Vec<Effect>) {
+        out.push((*def.effect).clone());
+        if let Some(sub) = def.sub_ability.as_deref() {
+            walk(sub, out);
+        }
+    }
+    let mut out = Vec::new();
+    for ability in &parsed.abilities {
+        walk(ability, &mut out);
+    }
+    for trigger in &parsed.triggers {
+        if let Some(execute) = trigger.execute.as_deref() {
+            walk(execute, &mut out);
+        }
+    }
+    out
+}
+
+/// CR 115.1 + the repo's honest-gap rule: no clause on this card may lower to
+/// `Effect::Unimplemented`. Pairs with the negative assertions below so they
+/// cannot pass for the wrong reason.
+fn assert_no_unimplemented(parsed: &ParsedAbilities) {
+    for effect in all_effects(parsed) {
+        assert!(
+            !matches!(effect, Effect::Unimplemented { .. }),
+            "no clause may parse to Effect::Unimplemented, found {effect:?}"
+        );
+    }
 }
 
 /// SHAPE: CR 115.1 — the printed "Target artifact you control" recipient must
@@ -103,6 +144,77 @@ fn shuri_parses_an_announced_artifact_recipient_distinct_from_the_copy_source() 
         source_tf.type_filters
     );
     assert_eq!(source_tf.controller, Some(ControllerRef::You));
+}
+
+/// SHAPE: the announced-recipient reading is gated on the copy source ALSO
+/// claiming a declared target slot.
+///
+/// CR 601.2c + CR 115.1: an announced recipient takes declared-target slot 0,
+/// which shifts the copy source to slot 1. That shift is only sound when the
+/// copy source itself is announced. Cytoshape — "Choose a nonlegendary creature
+/// on the battlefield. Target creature becomes a copy of **that creature** until
+/// end of turn." — names its copy source with an anaphor that resolves from
+/// chain context (`ParentTarget`) and occupies no slot, so slot 1 does not
+/// exist. Such cards must keep the pre-existing `Source` reading rather than
+/// gain an announced recipient the resolver could not pair with a copy source.
+///
+/// This is the blast-radius guard: without it, this change would alter runtime
+/// behaviour for cards outside the class it claims to fix (Cytoshape, Kaya
+/// Spirits' Justice, Polymorphous Rush, The Myriad Pools), converting a
+/// pre-existing honest gap into a resolution-time failure.
+#[test]
+fn a_context_ref_copy_source_keeps_the_pre_existing_source_recipient() {
+    const CYTOSHAPE_ORACLE: &str = "Choose a nonlegendary creature on the battlefield. \
+         Target creature becomes a copy of that creature until end of turn.";
+
+    let parsed = parse_oracle_text(
+        CYTOSHAPE_ORACLE,
+        "Cytoshape",
+        &[],
+        &["Instant".to_string()],
+        &[],
+    );
+    let copy = parsed
+        .abilities
+        .iter()
+        .find_map(|a| {
+            flatten(a)
+                .into_iter()
+                .find(|e| matches!(e, Effect::BecomeCopy { .. }))
+        })
+        .expect("Cytoshape must parse a BecomeCopy");
+
+    let Effect::BecomeCopy {
+        target, recipient, ..
+    } = &copy
+    else {
+        unreachable!("filtered on BecomeCopy above");
+    };
+
+    // Positive reach-guard for the negative below: this arm really is the
+    // context-ref copy-source shape, so the `Source` assertion cannot pass
+    // because the card failed to parse or took some unrelated branch.
+    assert!(
+        target.is_context_ref(),
+        "Cytoshape's copy source is the chain anaphor 'that creature', got {target:?}"
+    );
+    assert_eq!(
+        *recipient,
+        CopyRecipient::Source,
+        "a context-ref copy source must not gain an announced recipient — slot 1 \
+         would not exist and the resolver could find no copy source"
+    );
+}
+
+/// Every effect reachable from one ability definition, including its sub-chain.
+fn flatten(def: &AbilityDefinition) -> Vec<Effect> {
+    let mut out = vec![(*def.effect).clone()];
+    let mut cur = def.sub_ability.as_deref();
+    while let Some(node) = cur {
+        out.push((*node.effect).clone());
+        cur = node.sub_ability.as_deref();
+    }
+    out
 }
 
 /// RUNTIME: CR 707.2 + CR 115.1 — activating Shuri prompts for TWO targets and

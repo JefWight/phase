@@ -3937,23 +3937,37 @@ pub(super) fn static_affected_for_application(application: &SubjectApplication) 
 /// `static_affected_for_application` supplies the non-targeted filter so the
 /// anaphor/`inherits_parent` rewrite stays in one place.
 ///
-/// **Invariant.** A `Target(..)` filter must never be a context ref. Three
-/// authorities key off `crate::types::ability::CopyRecipient::announced_filter`, which declines a
-/// context-ref `Target`: the slot builder (no slot), the copy-source index
-/// (stays 0), and the resolver's recipient read (still `targets[0]`). A
-/// context-ref `Target` would therefore collapse the recipient and the copy
-/// source onto the same declared object. A context ref resolves from chain or
-/// event context rather than a player's announcement, so it belongs in
-/// `Untargeted` by construction — routed there here, at the single point where
-/// the variant is chosen, so the divergence is unrepresentable rather than
-/// merely unlikely.
-fn copy_recipient_for_application(application: &SubjectApplication) -> CopyRecipient {
+/// **Invariant.** A `Target(..)` filter must never be a context ref. Six
+/// authorities key off `crate::types::ability::CopyRecipient::announced_filter`,
+/// which is unconditional for `Target`: both slot builders, both target
+/// assigners, the chain target-sink predicate, and the resolver's copy-source
+/// index. A context-ref `Target` would therefore collapse the recipient and the
+/// copy source onto the same declared object. `CopyRecipient::targeted` owns
+/// that decision — here and on deserialization — so the divergence is
+/// unrepresentable rather than merely unlikely.
+///
+/// **Why the copy source gates the announced reading.** An announced recipient
+/// claims declared-target slot 0, which shifts the copy source to slot 1 (see
+/// `become_copy_copy_source_target_index`). That shift is only sound when the
+/// copy source ITSELF claims a declared slot. When the copy source is a context
+/// ref — Cytoshape's and Polymorphous Rush's `ParentTarget` ("that creature",
+/// naming a creature chosen by an earlier clause), The Myriad Pools' and Kaya's
+/// `TriggeringSource` — it is resolved from chain/event context and occupies no
+/// slot, so slot 1 does not exist and the resolver would find no copy source at
+/// all. Those cards keep the pre-existing `Source` reading: they were already an
+/// honest gap before this axis existed, and silently converting that gap into a
+/// resolution-time failure would be strictly worse (CLAUDE.md: an unreadable
+/// shape must stay visible, not be consumed). Sizing the change to exactly the
+/// class it fixes also keeps its blast radius equal to its claim.
+fn copy_recipient_for_application(
+    application: &SubjectApplication,
+    copy_source: &TargetFilter,
+) -> CopyRecipient {
     if let Some(target) = application.target.clone() {
-        return if target.is_context_ref() {
-            crate::types::ability::CopyRecipient::Untargeted(target)
-        } else {
-            crate::types::ability::CopyRecipient::Target(target)
-        };
+        if copy_source.is_context_ref() {
+            return crate::types::ability::CopyRecipient::Source;
+        }
+        return crate::types::ability::CopyRecipient::targeted(target);
     }
     match static_affected_for_application(application) {
         TargetFilter::SelfRef => crate::types::ability::CopyRecipient::Source,
@@ -4757,7 +4771,10 @@ fn build_become_clause(
             )),
         });
     }
-    // CR 611.2b: "Becomes" effects without explicit duration are permanent
+    // CR 611.2a: a continuous effect with no stated duration lasts until the end
+    // of the game, so an undurated "becomes" is permanent. (611.2b governs "for
+    // as long as …" windows, which is a different clause of the same rule and
+    // is what the attachment rewrite in `oracle_ir::ast` keys off.)
     let duration = duration.or(Some(Duration::Permanent));
 
     // CR 119.5: "life total becomes N" — set life total to a specific number.
@@ -4999,10 +5016,11 @@ fn build_become_clause(
             super::become_copy_except::parse_except_clause(remainder, card_name, ctx)
                 .map(|(_, mods)| mods)
                 .unwrap_or_default();
+        let recipient = copy_recipient_for_application(&application, &target);
         return Some(ParsedEffectClause {
             effect: Effect::BecomeCopy {
                 target,
-                recipient: copy_recipient_for_application(&application),
+                recipient,
                 duration: duration.clone(),
                 mana_value_limit: None,
                 additional_modifications,
@@ -5035,10 +5053,11 @@ fn build_become_clause(
             super::become_copy_except::parse_except_clause(remainder, card_name, ctx)
                 .map(|(_, mods)| mods)
                 .unwrap_or_default();
+        let recipient = copy_recipient_for_application(&application, &target);
         return Some(ParsedEffectClause {
             effect: Effect::BecomeCopy {
                 target,
-                recipient: copy_recipient_for_application(&application),
+                recipient,
                 duration: duration.clone(),
                 mana_value_limit: None,
                 additional_modifications,
