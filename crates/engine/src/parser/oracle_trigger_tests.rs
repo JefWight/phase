@@ -10140,7 +10140,7 @@ fn trigger_you_cast_oxford_comma_subtype_list_spell() {
 /// the earlier subtype-list-only approach mis-typed the core-type legs as
 /// bogus `Subtype("instant")`/`Subtype("sorcery")` filters that matched no
 /// spell, so instant/sorcery casts silently stopped triggering. The list must
-/// route through `parse_type_phrase` (which types each leg), NOT a
+/// route through `parse_type_phrase_folding` (which types each leg), NOT a
 /// subtype-only list parser.
 #[test]
 fn trigger_you_cast_oxford_comma_mixed_type_list_spell() {
@@ -10384,7 +10384,7 @@ fn trigger_you_cast_another_spell_keeps_another_filter() {
 
 /// CR 702.8a + CR 603.2 (issue #4754): Slitherwisp — "Whenever you cast another
 /// spell that has flash" must scope the trigger to flash spells. The "that has
-/// flash" keyword clause was dropped by `parse_type_phrase`, leaving only the
+/// flash" keyword clause was dropped by `parse_type_phrase_folding`, leaving only the
 /// `Another` prop, so the trigger over-fired on every non-first spell (a
 /// counterspell without flash wrongly triggered it). The spell filter must now
 /// carry BOTH `WithKeyword(Flash)` and `Another`.
@@ -11128,7 +11128,7 @@ fn trigger_intervening_if_that_creature_was_dealt_excess_damage_this_turn() {
 
 /// CR 120.10 + CR 603.4: Rith, Liberated Primeval's phase trigger with an
 /// opponent-scoped excess-damage intervening-if must set `channel: Excess`
-/// and produce a non-trivial target filter. `parse_type_phrase` emits
+/// and produce a non-trivial target filter. `parse_type_phrase_folding` emits
 /// `TargetFilter::Or` for compound types, so we check the channel and
 /// that the condition is a QuantityComparison with DamageDealtThisTurn.
 #[test]
@@ -13646,7 +13646,7 @@ fn trigger_nth_spell_opponent_noncreature() {
         "Esper Sentinel",
     );
     assert_eq!(def.mode, TriggerMode::SpellCast);
-    // parse_type_phrase("noncreature") produces [Non(Creature)] without a redundant
+    // parse_type_phrase_folding("noncreature") produces [Non(Creature)] without a redundant
     // Card base type — Non(Creature) alone is sufficient for spell-history filtering.
     assert_eq!(
         def.constraint,
@@ -25840,7 +25840,7 @@ fn trigger_if_it_wasnt_cast() {
 #[test]
 fn trigger_subject_extracts_opponent_as_player() {
     // CR 608.2k: "an opponent" should be recognized as a player-type subject,
-    // not fall through to parse_type_phrase returning Any.
+    // not fall through to parse_type_phrase_folding returning Any.
     let (filter, rest) =
         parse_single_subject("an opponent draws a card", &mut ParseContext::default());
     assert!(
@@ -26688,7 +26688,7 @@ fn you_attack_with_one_or_more_gods_populates_filter() {
 }
 
 /// Issue #610 (Anim Pakal class) — negated subtype head noun. "non-Gnome
-/// creatures" must yield a negated-Gnome filter on `valid_card`. `parse_type_phrase`
+/// creatures" must yield a negated-Gnome filter on `valid_card`. `parse_type_phrase_folding`
 /// already emits the negation; verify it survives onto `valid_card`.
 #[test]
 fn you_attack_with_one_or_more_non_gnome_creatures() {
@@ -28802,7 +28802,7 @@ fn high_tide_runtime_bonus_mana_routes_to_triggering_player_and_expires_at_eot()
 
 /// CR 614.12: Summoner's Grimoire's granted ability — the leading
 /// "if that card is an enchantment card" must materialize an
-/// `enters_modified_if` gate on the absorbed ChangeZone (via `parse_type_phrase`),
+/// `enters_modified_if` gate on the absorbed ChangeZone (via `parse_type_phrase_folding`),
 /// not be silently dropped while applying the riders unconditionally.
 #[test]
 fn grimoire_granted_trigger_gates_enters_on_moved_object_type() {
@@ -32086,5 +32086,150 @@ fn ogre_marauder_attack_trigger_carries_defending_player_unless_sacrifice() {
     assert!(
         !format!("{:?}", execute.effect).contains("Unimplemented"),
         "the body must not fall through to a parser gap"
+    );
+}
+
+/// CR 701.20a + CR 115.1: "target opponent reveals **their** hand" — when the
+/// clause names a DECLARED target as its subject, that subject is the
+/// possessive pronoun's antecedent, not the player who triggered the ability.
+/// The target is chosen as the triggered ability goes on the stack (CR 603.3d →
+/// CR 601.2c), so the reveal must show that chosen player's hand.
+///
+/// Issue #8428 (Brain Maggot). `parse_hand_possessive_target` resolves a bare
+/// "their hand" to `TriggeringPlayer`, which is correct only for a clause with
+/// no subject to bind to (`parse_look_at_possessive_hands_targets_player_axes`
+/// pins "Look at their hand." to exactly that, and it stays pinned). Because
+/// that default is not `Any`, `inject_subject_target`'s `Any`-guarded group
+/// could not correct it, so the pronoun default outranked a real declared
+/// subject and erased the target.
+///
+/// The two wordings below are the control pair: Brain Maggot and Kitesail
+/// Freebooter print the SAME clause and differ only in whether the choose
+/// clause is fused with "and" or split into its own sentence. Only the fused
+/// wording reaches the possessive parser — the split wording falls through it
+/// and was already binding its subject correctly. Asserting the two agree tests
+/// the building block (a possessive pronoun resolves to its clause subject)
+/// rather than one card's constant.
+#[test]
+fn possessive_their_hand_binds_to_the_clause_subject_not_the_trigger() {
+    fn reveal_target(line: &str) -> TargetFilter {
+        fn find(a: &AbilityDefinition) -> Option<TargetFilter> {
+            if let Effect::RevealHand { target, .. } = &*a.effect {
+                return Some(target.clone());
+            }
+            a.sub_ability.as_deref().and_then(find)
+        }
+        let def = parse_trigger_line(line, "Probe");
+        find(
+            def.execute
+                .as_ref()
+                .expect("trigger must have an execute body"),
+        )
+        .expect("trigger body must contain a RevealHand")
+    }
+
+    let opponent = TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent));
+
+    // Fused ("… and you choose …") — the wording that regressed.
+    let fused = reveal_target(
+        "When this creature enters, target opponent reveals their hand and you choose a nonland card from it. Exile that card until this creature leaves the battlefield.",
+    );
+    assert_eq!(
+        fused, opponent,
+        "\"target opponent reveals their hand\" must reveal the DECLARED target's hand"
+    );
+
+    // Split ("… their hand. You choose …") — the same clause, already correct.
+    let split = reveal_target(
+        "When this creature enters, target opponent reveals their hand. You choose a noncreature, nonland card from it. Exile that card until this creature leaves the battlefield.",
+    );
+    assert_eq!(
+        fused, split,
+        "fusing the choose clause with \"and\" must not change whose hand is revealed"
+    );
+
+    // The same pronoun under a "that player" subject still resolves
+    // to the triggering player — the fix defers to the subject, it does not
+    // rewrite every reveal to an opponent (Biting-Palm Ninja).
+    assert_eq!(
+        reveal_target(
+            "When you do, that player reveals their hand and you choose a nonland card from it. Exile that card.",
+        ),
+        TargetFilter::TriggeringPlayer,
+        "\"that player reveals their hand\" must still bind to the triggering player"
+    );
+}
+
+/// Runtime half of the issue #8428 fix: the corrected AST must actually put the
+/// TARGET OPPONENT's cards in front of the controller. Drives Brain Maggot's
+/// verbatim Oracle text through the real cast pipeline (CR 601.2 cast → ETB
+/// trigger per CR 603.2 → CR 603.3d target choice → CR 701.20a reveal) and
+/// asserts on the hand the engine offers for the choose clause.
+///
+/// A parse-only assertion cannot see this: the reveal resolver reads its player
+/// from `ability.targets` first, and a `TriggeringPlayer` effect target builds
+/// NO player slot at all, so the wrong-hand behavior only becomes visible once
+/// the trigger reaches the stack.
+#[test]
+fn brain_maggot_reveals_the_target_opponents_hand_at_runtime() {
+    use crate::types::phase::Phase;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            crate::types::mana::ManaUnit::new(
+                crate::types::mana::ManaType::Black,
+                crate::types::identifiers::ObjectId(98_420),
+                false,
+                Vec::new(),
+            ),
+            crate::types::mana::ManaUnit::new(
+                crate::types::mana::ManaType::Black,
+                crate::types::identifiers::ObjectId(98_421),
+                false,
+                Vec::new(),
+            ),
+        ],
+    );
+
+    let maggot = scenario
+        .add_creature_to_hand_from_oracle(
+            P0,
+            "Brain Maggot",
+            1,
+            1,
+            "When this creature enters, target opponent reveals their hand and you choose a nonland card from it. Exile that card until this creature leaves the battlefield.",
+        )
+        .id();
+
+    // Distinct hands so the revealed set identifies its owner unambiguously.
+    let mine = scenario.add_card_to_hand(P0, "Duress");
+    let theirs_a = scenario.add_card_to_hand(P1, "Llanowar Elves");
+    let theirs_b = scenario.add_card_to_hand(P1, "Giant Growth");
+
+    let mut runner = scenario.build();
+    let outcome = runner.cast(maggot).target_player(P1).resolve();
+
+    let WaitingFor::RevealChoice { player, cards, .. } = outcome.final_waiting_for() else {
+        panic!(
+            "expected the reveal's choose prompt, got {:?}",
+            outcome.final_waiting_for()
+        );
+    };
+    assert_eq!(
+        *player, P0,
+        "CR 109.5: \"you choose\" is the ability's controller, not the revealing player"
+    );
+
+    let revealed: std::collections::HashSet<_> = cards.iter().copied().collect();
+    assert!(
+        revealed.contains(&theirs_a) && revealed.contains(&theirs_b),
+        "the TARGET OPPONENT's hand must be revealed, got {revealed:?}"
+    );
+    assert!(
+        !revealed.contains(&mine),
+        "the controller's own hand must NOT be revealed (issue #8428), got {revealed:?}"
     );
 }

@@ -7,6 +7,8 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::database::card_db::CardDbHandle;
+
 use super::ability::{
     default_target_filter_permanent, legacy_trigger_entry_list,
     materialize_legacy_printed_trigger_entries, AbilityCost, AbilityDefinition, AdditionalCost,
@@ -804,17 +806,28 @@ impl NamedChoiceSource {
     /// moved to a public zone as part of its own resolution, the still-pending
     /// resolution may find that successor. A later same-id object cannot match
     /// the relatch's original/current incarnation pair.
+    ///
+    /// CR 614.12a: an entry replacement's required choice is made before the
+    /// permanent enters, so the "exact object" a persisting as-enters choice must
+    /// bind to can still be a liminal projection rather than a stored object —
+    /// hence the [`GameState::entering_or_live_object`] read here and the
+    /// matching [`GameState::chosen_attributes_mut`] write below. The relatch
+    /// branch stays `objects`-only: CR 400.7j is about a source that has already
+    /// MOVED between zones, which an entrant that has not yet entered cannot have
+    /// done.
     pub fn source_mut_exact_for_resolution<'a>(
         &self,
         state: &'a mut GameState,
-    ) -> Option<&'a mut GameObject> {
+    ) -> Option<&'a mut Vec<ChosenAttribute>> {
         let context = self.context.as_ref()?;
         let identity = &context.identity;
         let object_id = identity.reference.object_id;
-        let is_exact = state.objects.get(&object_id).is_some_and(|object| {
-            ObjectIncarnationRef::from_object(object) == identity.reference
-                && object.zone == identity.expected_zone
-        });
+        let is_exact = state
+            .entering_or_live_object(object_id)
+            .is_some_and(|object| {
+                ObjectIncarnationRef::from_object(object) == identity.reference
+                    && object.zone == identity.expected_zone
+            });
         let is_resolution_successor =
             state
                 .resolution_source_relatch
@@ -827,9 +840,26 @@ impl NamedChoiceSource {
                             .get(&object_id)
                             .is_some_and(|object| object.incarnation == relatch.current_incarnation)
                 });
-        (is_exact || is_resolution_successor)
-            .then(|| state.objects.get_mut(&object_id))
-            .flatten()
+        // Each branch writes through the lookup its own check validated. The
+        // exact branch validated `entering_or_live_object`, so it writes through
+        // the liminal-first `chosen_attributes_mut`. The relatch branch validated
+        // `state.objects` alone — CR 400.7j finds an object that has already MOVED
+        // to a public zone, which an entrant that has not yet entered cannot have
+        // done — so it writes through `objects` alone. Funnelling both through
+        // `chosen_attributes_mut` would let a liminal projection sharing this id
+        // (`meld::finish_meld_entry` stores the CR 701.42 meld result under the
+        // component's own id) receive a write the relatch validated against the
+        // stored object.
+        if is_exact {
+            state.chosen_attributes_mut(object_id)
+        } else if is_resolution_successor {
+            state
+                .objects
+                .get_mut(&object_id)
+                .map(|object| &mut object.chosen_attributes)
+        } else {
+            None
+        }
     }
 }
 
@@ -16906,6 +16936,14 @@ impl TokenProjection {
     pub fn set_tapped(&mut self, tapped: bool) {
         self.0.tapped = tapped;
     }
+
+    /// CR 607.2d + CR 614.12a: an entry replacement that requires a choice makes
+    /// that choice BEFORE the permanent enters, so the answer has to land on the
+    /// entrant while it is still a projection. Narrow for the same reason
+    /// [`TokenProjection::set_tapped`] is: one field, not the whole object.
+    pub fn chosen_attributes_mut(&mut self) -> &mut Vec<ChosenAttribute> {
+        &mut self.0.chosen_attributes
+    }
 }
 
 /// CR 614.12: the entrant of a liminal (decided-but-not-yet-entered) projection.
@@ -16955,6 +16993,16 @@ impl LiminalEntrant {
     /// witness rather than by trusting a flag on the projected object.
     pub fn is_token_projection(&self) -> bool {
         matches!(self, Self::Token(_))
+    }
+
+    /// CR 607.2d + CR 614.12a: the entrant's chosen-attribute list, so a
+    /// persisting as-enters choice binds to the projection that is about to
+    /// become the permanent. See [`TokenProjection::chosen_attributes_mut`].
+    pub fn chosen_attributes_mut(&mut self) -> &mut Vec<ChosenAttribute> {
+        match self {
+            Self::Token(token) => token.chosen_attributes_mut(),
+            Self::Card(object) => &mut object.chosen_attributes,
+        }
     }
 
     /// CR 614.1c: settle the entrant's tapped state before it enters.
@@ -18913,21 +18961,24 @@ declare_game_state! {
     #[serde(skip)]
     pub meld_pair_registry: Arc<HashMap<String, MeldPairRecord>>,
 
-    /// Momir Basic selection index: mana value -> sorted creature face names.
-    /// CR 707.2 + CR 202.3: the random-token pool, keyed by mana value so the
-    /// emblem's `{X}` ability can pick a creature with mana value X. Built only
-    /// when `format == Momir` (see `rehydrate_card_db_metadata`); empty
-    /// otherwise. Skipped in serialization and rebuilt deterministically per peer
-    /// from the loaded card DB.
+    /// Handle to the loaded card database, for the rare resolver that must
+    /// query the WHOLE card corpus at resolution time instead of pre-staging a
+    /// copy of it into state.
+    ///
+    /// CR 707.2 + CR 202.3: the Momir Basic emblem's `{X}` ability creates a
+    /// token that's a copy of a creature card with mana value X "chosen at
+    /// random" — a draw over every printed creature. Materializing that corpus
+    /// into `GameState` (the previous `momir_pool` / `momir_pool_faces` pair)
+    /// meant holding ~19,500 `CardFace` clones of data the card database
+    /// already owns in the same engine instance. The resolver now draws one
+    /// face on demand through this handle.
+    ///
+    /// `Arc` inside [`CardDbHandle`] keeps `GameState::clone()` during AI
+    /// search O(1), matching `all_card_names` / `card_face_registry`. Skipped
+    /// in serialization and reinstalled by `install_card_db` on every path that
+    /// builds or restores a game.
     #[serde(skip)]
-    pub momir_pool: BTreeMap<i32, Vec<String>>,
-
-    /// Momir Basic hydration map: lowercase creature name -> `CardFace`. The
-    /// resolver reads this (NEVER `card_face_registry`, which is conjure-scoped
-    /// and misses most creatures) to build the copy token. Skipped in
-    /// serialization; rebuilt with `momir_pool`.
-    #[serde(skip)]
-    pub momir_pool_faces: Arc<HashMap<String, CardFace>>,
+    pub card_db: Option<CardDbHandle>,
 
     /// CR 400.11: the sealed booster products this game can open packs from.
     /// Populated only when some card in the game carries
@@ -19942,6 +19993,26 @@ pub struct PostReplacementDrain {
     /// CR 615.5: target of the prevented event itself, for
     /// `TargetFilter::PostReplacementDamageTarget`.
     pub event_target: Option<crate::types::ability::TargetRef>,
+
+    /// CR 109.5: the player "you" names inside this continuation — the
+    /// controller of the object whose ability is doing the replacing.
+    ///
+    /// Distinct from [`Self::source`] and deliberately a `PlayerId` rather than
+    /// an `ObjectId`: `source` is the object a `SelfRef` post-effect resolves
+    /// against (rebound to the *affected* object on every zone-change path, and
+    /// cleared outright by [`GameState::clear_post_replacement_source`]), while
+    /// this is the ability's controller, fixed when the replacement applied.
+    /// CR 614.6 makes that snapshot load-bearing: the modified event and its
+    /// continuation are one step, and the replacing object may already be gone
+    /// by drain time (Head of the Hunt dying in the same state-based-action
+    /// batch as the creature it exiles), so a drain-time object lookup would
+    /// answer `None` exactly when the rider still has to name its controller.
+    ///
+    /// `None` on every install path that has no replacing object to speak of —
+    /// combat-prevention riders, the ready-continuation helpers, test fixtures —
+    /// where the affected object's controller remains the fallback.
+    #[serde(default)]
+    pub controller: Option<crate::types::player::PlayerId>,
 }
 
 /// CR 616.1g: what an install does when a continuation is already resident.
@@ -20051,6 +20122,7 @@ impl PostReplacementDrain {
             applied: HashSet::new(),
             event_source: None,
             event_target: None,
+            controller: None,
         }
     }
 
@@ -22037,10 +22109,47 @@ impl GameState {
         self.resolution_stack.active_spell_resolution_mut()
     }
 
-    /// Parks permanent-spell completion context above the replacement choice
-    /// that suspended its entry.
+    /// Parks permanent-spell completion context as the active frame. This is the
+    /// NO-CHILD case only: a call site that follows a producer which may have
+    /// raised a resolution frame must use `push_spell_resolution_after_child`,
+    /// which parks the parent BENEATH that child stack. Pushing on top of a live
+    /// child makes every top-only resume accessor read `None` and strands both
+    /// frames.
     pub fn push_spell_resolution(&mut self, pending: PendingSpellResolution) {
         self.resolution_stack.push_spell_resolution(pending);
+    }
+
+    /// Park permanent-spell completion context beneath the complete child stack
+    /// its own delivery raised. The recorded depth is structural, not a search for
+    /// a buried parent.
+    ///
+    /// CR 616.1 / CR 616.1f + CR 614.1c: the delivery tail's enters-with-counters
+    /// step can pause on an ordering choice among applicable counter replacements,
+    /// and the queue that owns the remaining work is read TOP-ONLY. That queue is
+    /// therefore a CHILD of the resolving spell, and the CR 608.3a completion
+    /// context parked for it must never sit above it.
+    pub fn push_spell_resolution_after_child(
+        &mut self,
+        pending: PendingSpellResolution,
+        child_stack_start: ChildStackDepth,
+    ) {
+        match self
+            .resolution_stack
+            .capture_child_boundary()
+            .cmp(&child_stack_start)
+        {
+            std::cmp::Ordering::Less => {
+                panic!("spell delivery removed a parent before it could be parked")
+            }
+            std::cmp::Ordering::Equal => self.push_spell_resolution(pending),
+            std::cmp::Ordering::Greater => self
+                .resolution_stack
+                .insert_parent_at_child_boundary(
+                    super::resolution::ResolutionFrame::SpellResolution(pending),
+                    child_stack_start,
+                )
+                .expect("parked spell resolution must be inserted below its child stack"),
+        }
     }
 
     /// Consumes exactly the active permanent-spell completion context. Child
@@ -23709,8 +23818,7 @@ impl GameState {
             all_card_names: Arc::from([]),
             card_face_registry: Arc::new(HashMap::new()),
             meld_pair_registry: Arc::new(HashMap::new()),
-            momir_pool: BTreeMap::new(),
-            momir_pool_faces: Arc::new(HashMap::new()),
+            card_db: None,
             booster_shelf: Arc::new(BoosterShelf::default()),
             log_player_names: Vec::new(),
             last_created_token_ids: Vec::new(),
@@ -23810,6 +23918,105 @@ impl GameState {
     pub fn set_match_config(&mut self, config: MatchConfig) {
         self.match_config = config;
         self.loop_detection = config.loop_detection;
+    }
+
+    /// CR 614.12: the object `id` names — "the characteristics of the permanent
+    /// as it would exist on the battlefield" — including an entrant whose entry
+    /// has been decided but has not yet committed.
+    ///
+    /// Single authority for the objects-vs-liminal precedence. A liminal entry is
+    /// deliberately absent from `objects` while its own entry replacements run, so
+    /// a seam that reads `objects` alone is blind to every entering token and to
+    /// the CR 701.42 meld result. The liminal projection wins where both exist:
+    /// for a meld the object still stored under that id is the entrant's PRE-entry
+    /// self (the exiled front-face component), which is not what CR 614.12 asks
+    /// about.
+    ///
+    /// This replaces three hand-rolled copies of the same lookup
+    /// (`filter::entering_object_projection`,
+    /// `zone_pipeline::entering_object_projection`, and
+    /// `engine_replacement::apply_post_replacement_effect`'s inline dual lookup).
+    /// `engine_replacement::copy_effect_for_source` still branches on
+    /// `liminal_entries` itself: it is not this lookup, because the two branches
+    /// search different ability sets (an entrant's own replacement definitions
+    /// versus `functioning_abilities::active_replacements`, which additionally
+    /// filters phased-out and non-emblem command-zone sources).
+    ///
+    /// Reach for this in any seam that resolves an ability's `source_id` during an
+    /// entry chain.
+    pub fn entering_or_live_object(&self, id: ObjectId) -> Option<&GameObject> {
+        self.liminal_entries
+            .get(&id)
+            .map(|entry| entry.object.projected())
+            .or_else(|| self.objects.get(&id))
+    }
+
+    /// CR 607.2d: the chosen-attribute list of the object `id` names, with the
+    /// same liminal precedence as [`GameState::entering_or_live_object`].
+    ///
+    /// Deliberately narrower than a `&mut GameObject`: an entering token is stored
+    /// as a [`TokenProjection`], whose whole purpose is to keep the CR 111.1
+    /// is-a-token witness out of a caller's reach. A persisting `Effect::Choose`
+    /// ("As this ~ enters, choose a colour", Tribute's CR 702.104a opponent
+    /// choice) needs exactly this one list and nothing else, so this is the whole
+    /// mutable surface it gets. Attributes written here survive the entry:
+    /// `token::commit_liminal_token_entry_with_post_actions` inserts the
+    /// projection itself into `objects`.
+    pub fn chosen_attributes_mut(&mut self, id: ObjectId) -> Option<&mut Vec<ChosenAttribute>> {
+        if let Some(entry) = self.liminal_entries.get_mut(&id) {
+            return Some(entry.object.chosen_attributes_mut());
+        }
+        self.objects
+            .get_mut(&id)
+            .map(|object| &mut object.chosen_attributes)
+    }
+
+    /// CR 614.1c + CR 122.6a: schedule counters onto a TOKEN entrant whose entry
+    /// has been decided but has not yet committed, so they are placed AS it enters
+    /// rather than added to it afterwards.
+    ///
+    /// Returns `false` when `id` names no such entrant, which is the caller's
+    /// signal to take its ordinary live-object path.
+    ///
+    /// The distinction is not bookkeeping. CR 702.104a's tribute counters, and
+    /// every other "as it enters" counter, are placed as part of the entry event,
+    /// so they must go through the entry's own CR 614.1a replacement pass —
+    /// Doubling Season, Corpsejack Menace, Hardened Scales all apply to them.
+    /// Adding them after the commit instead would be a second, separate event
+    /// that those replacements have already declined to modify, and would let the
+    /// permanent exist for an observable instant without the counters it entered
+    /// with (CR 704.5f decides a 0/0 entrant on exactly that instant).
+    ///
+    /// # Why only a token entrant
+    ///
+    /// CR 111.1: a token entrant "is a marker used to represent any permanent
+    /// that isn't represented by a card" and, until this entry commits, it sits in
+    /// no zone — there is no object under its id at all, so an ordinary counter
+    /// addition would find nothing and silently drop the counters. The other
+    /// entrant kind, the CR 701.42 meld result, is card-backed: the id still names
+    /// a real object (the entrant's pre-entry self), an ordinary addition reaches
+    /// it, and `meld::commit_meld_battlefield` does not consume
+    /// `LiminalEntry::enter_with_counters` at all — so redirecting a meld here
+    /// would be the very silent drop this exists to prevent. The stored CR 111.1
+    /// witness answers which kind this is, rather than a flag to be trusted.
+    pub fn schedule_entry_counters(
+        &mut self,
+        id: ObjectId,
+        counter_type: CounterType,
+        count: u32,
+    ) -> bool {
+        let Some(entry) = self
+            .liminal_entries
+            .get_mut(&id)
+            .filter(|entry| entry.object.is_token_projection())
+        else {
+            return false;
+        };
+        // The commit folds this list into the entry's counter pass in order, so
+        // appending is what puts these counters after any the creating effect
+        // already specified — CR 702.104a's "an ADDITIONAL N +1/+1 counters".
+        entry.enter_with_counters.push((counter_type, count));
+        true
     }
 
     /// Returns the current timestamp and increments for next use.
@@ -24433,6 +24640,18 @@ impl GameState {
         self.active_post_replacement_drains()?
             .resident()
             .and_then(|drain| drain.source)
+    }
+
+    /// CR 109.5: the resident drain's replacing ability's controller — the
+    /// player "you" refers to in the continuation. See
+    /// [`PostReplacementDrain::controller`]; unlike
+    /// [`Self::post_replacement_source`] this survives
+    /// [`Self::clear_post_replacement_source`], because clearing the `SelfRef`
+    /// referent says nothing about whose ability produced the continuation.
+    pub fn post_replacement_controller(&self) -> Option<crate::types::player::PlayerId> {
+        self.active_post_replacement_drains()?
+            .resident()
+            .and_then(|drain| drain.controller)
     }
 
     /// CR 615.5 + CR 609.7: the resident drain's *prevented-event* source — the
@@ -25730,8 +25949,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         all_card_names: _,
         card_face_registry: _,
         meld_pair_registry: _,
-        momir_pool: _,
-        momir_pool_faces: _,
+        card_db: _,
         booster_shelf: _,
         log_player_names: _,
         last_created_token_ids: _,
