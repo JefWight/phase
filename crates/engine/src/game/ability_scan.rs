@@ -8592,7 +8592,7 @@ mod tests {
             },
             Effect::BecomeCopy {
                 target: f(),
-                recipient: f(),
+                recipient: crate::types::ability::CopyRecipient::Untargeted(f()),
                 duration: None,
                 mana_value_limit: None,
                 additional_modifications: vec![],

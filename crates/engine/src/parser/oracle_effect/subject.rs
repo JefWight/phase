@@ -17,9 +17,9 @@ use super::{resolve_it_pronoun, ParseContext};
 use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, ChosenSubtypeKind, ColorChangeMode, ContinuousModification,
-    ControllerRef, Duration, EachDamageRecipient, Effect, EffectScope, FilterProp, MultiTargetSpec,
-    ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef, StaticCondition,
-    StaticDefinition, TargetFilter, TypedFilter,
+    ControllerRef, CopyRecipient, Duration, EachDamageRecipient, Effect, EffectScope, FilterProp,
+    MultiTargetSpec, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
+    StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -3908,6 +3908,58 @@ pub(super) fn static_affected_for_application(application: &SubjectApplication) 
     }
 }
 
+/// CR 707.2 + CR 115.1 + CR 611.2c: map a parsed "<subject> become[s] a copy /
+/// copies of …" subject onto [`CopyRecipient`] — WHO becomes the copy.
+///
+/// Single authority for both the singular ("a copy of") and plural ("copies
+/// of") arms of [`build_become_clause`]. They disagreed before: the singular arm
+/// hardcoded the source and discarded the subject entirely, so every card whose
+/// recipient is NOT the source silently copied onto the wrong permanent and
+/// announced one target too few (Shuri, Wakandan Inventor; True Polymorph;
+/// Shapesharer; Saheeli, Sublime Artificer; The Animus; Mirrorweave; Mirrorform;
+/// Reflection Net).
+///
+/// The three readings come straight off `SubjectApplication`:
+///
+/// - CR 115.1 — a DECLARED target subject ("**Target** artifact you control
+///   becomes a copy of …") is announced, so it becomes
+///   [`crate::types::ability::CopyRecipient::Target`]. Declared first in printed order, hence first in
+///   target-declaration order (CR 601.2c).
+/// - CR 707.2 — a self subject (`~`, or an anaphoric "it"/"this creature"
+///   naming the source) is [`crate::types::ability::CopyRecipient::Source`]. This is the incumbent
+///   path for every already-shipping self-copy card and must stay
+///   byte-identical.
+/// - CR 611.2c — any other subject ("**Each other** creature", "Shards you
+///   control", an `AttachedTo` host) names an untargeted set determined as the
+///   effect resolves, so it becomes [`crate::types::ability::CopyRecipient::Untargeted`].
+///
+/// `static_affected_for_application` supplies the non-targeted filter so the
+/// anaphor/`inherits_parent` rewrite stays in one place.
+///
+/// **Invariant.** A `Target(..)` filter must never be a context ref. Three
+/// authorities key off `crate::types::ability::CopyRecipient::announced_filter`, which declines a
+/// context-ref `Target`: the slot builder (no slot), the copy-source index
+/// (stays 0), and the resolver's recipient read (still `targets[0]`). A
+/// context-ref `Target` would therefore collapse the recipient and the copy
+/// source onto the same declared object. A context ref resolves from chain or
+/// event context rather than a player's announcement, so it belongs in
+/// `Untargeted` by construction — routed there here, at the single point where
+/// the variant is chosen, so the divergence is unrepresentable rather than
+/// merely unlikely.
+fn copy_recipient_for_application(application: &SubjectApplication) -> CopyRecipient {
+    if let Some(target) = application.target.clone() {
+        return if target.is_context_ref() {
+            crate::types::ability::CopyRecipient::Untargeted(target)
+        } else {
+            crate::types::ability::CopyRecipient::Target(target)
+        };
+    }
+    match static_affected_for_application(application) {
+        TargetFilter::SelfRef => crate::types::ability::CopyRecipient::Source,
+        filter => crate::types::ability::CopyRecipient::Untargeted(filter),
+    }
+}
+
 fn merge_partial_type_phrase_filter(filter: TargetFilter, remainder: &str) -> TargetFilter {
     if remainder.is_empty() {
         return filter;
@@ -4949,7 +5001,7 @@ fn build_become_clause(
         return Some(ParsedEffectClause {
             effect: Effect::BecomeCopy {
                 target,
-                recipient: TargetFilter::SelfRef,
+                recipient: copy_recipient_for_application(&application),
                 duration: duration.clone(),
                 mana_value_limit: None,
                 additional_modifications,
@@ -4985,7 +5037,7 @@ fn build_become_clause(
         return Some(ParsedEffectClause {
             effect: Effect::BecomeCopy {
                 target,
-                recipient: static_affected_for_application(&application),
+                recipient: copy_recipient_for_application(&application),
                 duration: duration.clone(),
                 mana_value_limit: None,
                 additional_modifications,

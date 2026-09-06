@@ -168,7 +168,7 @@ fn a_parser_lowers_middle_clause_between_exile_and_return() {
                 "donor = the exiled 'it'"
             );
             match recipient {
-                TargetFilter::Typed(tf) => {
+                engine::types::ability::CopyRecipient::Untargeted(TargetFilter::Typed(tf)) => {
                     assert!(
                         tf.type_filters
                             .contains(&TypeFilter::Subtype("Shard".to_string())),
@@ -420,7 +420,10 @@ fn e_recipient_is_not_a_target() {
     // above is not vacuously matching a SelfRef donor).
     match &become_copy {
         Effect::BecomeCopy { recipient, .. } => assert!(
-            matches!(recipient, TargetFilter::Typed(_)),
+            matches!(
+                recipient,
+                engine::types::ability::CopyRecipient::Untargeted(TargetFilter::Typed(_))
+            ),
             "recipient is the typed Shard group, distinct from the donor"
         ),
         _ => unreachable!(),
@@ -451,8 +454,8 @@ fn f_single_subject_recipient_selfref_omitted_from_json() {
         Effect::BecomeCopy { recipient, .. } => {
             assert_eq!(
                 *recipient,
-                TargetFilter::SelfRef,
-                "single-subject copy recipient defaults to SelfRef"
+                engine::types::ability::CopyRecipient::Source,
+                "single-subject copy recipient defaults to the ability's own source"
             );
         }
         other => panic!("expected BecomeCopy, got {other:?}"),
@@ -517,12 +520,14 @@ fn plural_arm_covers_recipient_class_not_just_niko() {
             ..
         } => {
             match recipient {
-                TargetFilter::Typed(tf) => assert!(
-                    tf.type_filters
-                        .contains(&TypeFilter::Subtype("Shapeshifter".to_string()))
-                        && tf.controller == Some(ControllerRef::You),
-                    "recipient = Shapeshifters you control: {tf:#?}"
-                ),
+                engine::types::ability::CopyRecipient::Untargeted(TargetFilter::Typed(tf)) => {
+                    assert!(
+                        tf.type_filters
+                            .contains(&TypeFilter::Subtype("Shapeshifter".to_string()))
+                            && tf.controller == Some(ControllerRef::You),
+                        "recipient = Shapeshifters you control: {tf:#?}"
+                    )
+                }
                 other => panic!("recipient must be a typed group: {other:#?}"),
             }
             assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
@@ -547,7 +552,7 @@ fn plural_arm_covers_recipient_class_not_just_niko() {
     );
     match &dc[0] {
         Effect::BecomeCopy { recipient, .. } => match recipient {
-            TargetFilter::Typed(tf) => assert!(
+            engine::types::ability::CopyRecipient::Untargeted(TargetFilter::Typed(tf)) => assert!(
                 tf.type_filters.contains(&TypeFilter::Creature)
                     && tf.controller == Some(ControllerRef::You),
                 "recipient = other creatures you control: {tf:#?}"

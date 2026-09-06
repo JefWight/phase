@@ -143,7 +143,7 @@ fn copy_chosen_host_relation_synthesizes_only_the_selected_source_and_preserves_
                 AbilityKind::Spell,
                 Effect::BecomeCopy {
                     target: TargetFilter::Any,
-                    recipient: TargetFilter::SelfRef,
+                    recipient: crate::types::ability::CopyRecipient::Source,
                     duration: None,
                     mana_value_limit: None,
                     additional_modifications: vec![
@@ -27949,7 +27949,7 @@ fn render_net_reaches_every_nested_description_carrier() {
 
     parsed.abilities.push(carrier(Effect::BecomeCopy {
         target: TargetFilter::Any,
-        recipient: TargetFilter::SelfRef,
+        recipient: crate::types::ability::CopyRecipient::Source,
         duration: None,
         mana_value_limit: None,
         additional_modifications: vec![granted("become_copy")],

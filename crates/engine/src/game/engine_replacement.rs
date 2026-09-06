@@ -1891,7 +1891,7 @@ pub(super) fn handle_copy_target_choice(
                 ResolvedAbility::new(
                     Effect::BecomeCopy {
                         target: TargetFilter::Any,
-                        recipient: TargetFilter::SelfRef,
+                        recipient: crate::types::ability::CopyRecipient::Source,
                         duration: None,
                         mana_value_limit: None,
                         additional_modifications: Vec::new(),
@@ -2121,7 +2121,7 @@ pub(super) fn handle_copy_target_choice(
             ResolvedAbility::new(
                 Effect::BecomeCopy {
                     target: TargetFilter::Any,
-                    recipient: TargetFilter::SelfRef,
+                    recipient: crate::types::ability::CopyRecipient::Source,
                     duration: None,
                     mana_value_limit: None,
                     additional_modifications: Vec::new(),
@@ -5858,7 +5858,7 @@ mod tests {
             },
             Effect::BecomeCopy {
                 target: TargetFilter::ExiledCardByIndex { index: 0 },
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 duration: Some(crate::types::ability::Duration::Permanent),
                 mana_value_limit: None,
                 additional_modifications: Vec::new(),
@@ -6168,7 +6168,7 @@ mod tests {
                 AbilityKind::Spell,
                 Effect::BecomeCopy {
                     target: TargetFilter::SpecificObject { id: chosen },
-                    recipient: TargetFilter::SelfRef,
+                    recipient: crate::types::ability::CopyRecipient::Source,
                     duration: Some(crate::types::ability::Duration::Permanent),
                     mana_value_limit: None,
                     additional_modifications: Vec::new(),
@@ -6786,7 +6786,7 @@ mod tests {
                     .execute(AbilityDefinition::new(
                         AbilityKind::Spell,
                         Effect::BecomeCopy {
-                            recipient: TargetFilter::SelfRef,
+                            recipient: crate::types::ability::CopyRecipient::Source,
                             target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
                             duration: None,
                             mana_value_limit: None,
@@ -6996,7 +6996,7 @@ mod tests {
                     .execute(AbilityDefinition::new(
                         AbilityKind::Spell,
                         Effect::BecomeCopy {
-                            recipient: TargetFilter::SelfRef,
+                            recipient: crate::types::ability::CopyRecipient::Source,
                             target: copy_filter,
                             duration: None,
                             mana_value_limit: None,
@@ -7121,7 +7121,7 @@ mod tests {
                     .execute(AbilityDefinition::new(
                         AbilityKind::Spell,
                         Effect::BecomeCopy {
-                            recipient: TargetFilter::SelfRef,
+                            recipient: crate::types::ability::CopyRecipient::Source,
                             target: copy_filter,
                             duration: None,
                             mana_value_limit: None,
@@ -7795,7 +7795,7 @@ mod tests {
             AbilityKind::Spell,
             Effect::BecomeCopy {
                 target: TargetFilter::Any,
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 duration: Some(Duration::Permanent),
                 mana_value_limit: Some(CopyManaValueLimit::AmountSpentToCastSource),
                 additional_modifications: Vec::new(),
@@ -7809,7 +7809,7 @@ mod tests {
             AbilityKind::Spell,
             Effect::BecomeCopy {
                 target: TargetFilter::Any,
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 duration: Some(Duration::Permanent),
                 mana_value_limit: None,
                 additional_modifications: Vec::new(),
