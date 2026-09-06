@@ -425,6 +425,21 @@ export function HostSetup({
     ? Math.min(formatConfig.max_players, P2P_MAX_PEERS)
     : formatConfig.max_players;
   const accentTone = isP2P ? "cyan" : "emerald";
+  // A P2P room reaches the public list only through a `LobbyOnly` broker: that
+  // is the sole path `MultiplayerPage` takes into `startP2PHostingSession` with
+  // `useBroker`, and `openBrokerClient` refuses every other mode. Against a
+  // `Full` anchor there is nothing to register with — `hostIsPublic` is false
+  // whatever this form submits — so offering the toggle there would be a
+  // control with no effect.
+  //
+  // Withheld on POSITIVE knowledge only. `sourceStatus` is not persisted, so a
+  // cold mount knows no mode until the handshake lands; treating that as "no
+  // broker" would make the row appear a beat after the form, and the default
+  // anchor is a broker anyway. Unknown therefore reads as available.
+  const p2pListingUnavailable =
+    isP2P
+    && hostingServer !== null
+    && sourceStatus.get(hostingServer)?.serverInfo?.mode === "Full";
 
   /** Apply a freshly-resolved format config. Shared by the built-in picker and
    *  the saved-custom-format picker so both reset the same dependent state. */
@@ -545,6 +560,28 @@ export function HostSetup({
     setAiSeats((prev) => prev.filter((s) => s.seatIndex < count));
   };
 
+  // A format whose MINIMUM exceeds the P2P ceiling cannot be clamped into
+  // range — only replaced. The mount path above screens the REMEMBERED config
+  // for this, but not the store `formatConfig` it falls back to, and it cannot
+  // see a switch made while this form stays mounted — so this effect covers
+  // both a store-seeded mount and the live flip. Without it the seat clamp
+  // below drives `playerCount` under
+  // `formatConfig.min_players`: the seat picker renders an empty range
+  // (`Array.from` coerces the negative length to 0) and Host submits a
+  // configuration the format itself rejects. Only a custom format can reach
+  // this — every built-in one seats at most `P2P_MAX_PEERS` — so the fallback
+  // is the same default the mount path uses, applied through
+  // `applyResolvedFormat` so every dependent field resets with it. Both effects
+  // run in the SAME commit, so the clamp below would otherwise read this
+  // render's stale `playerCount` and overwrite the seat count set here —
+  // landing on the ceiling rather than the replacement format's own minimum.
+  // It yields to this guard instead; see its own comment.
+  useEffect(() => {
+    if (!isP2P || formatConfig.min_players <= P2P_MAX_PEERS) return;
+    applyResolvedFormat("Commander", FORMAT_DEFAULTS.Commander, null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isP2P, formatConfig.min_players]);
+
   // The mode switch above this form can lower the seat ceiling while the form
   // is mounted (P2P seats at most `P2P_MAX_PEERS`), and this component is not
   // remounted on a mode change — so the mount-time clamp on `playerCount`
@@ -553,14 +590,19 @@ export function HostSetup({
   // `handlePlayerCountChange` so the AI seats past the new count are pruned
   // with it rather than being submitted from `effectiveAiSeats`.
   //
-  // Guarded on the comparison and depending on `[playerCount, maxPlayers]`
-  // deliberately: `handlePlayerCountChange` is a component-body function whose
-  // identity changes every render, so depending on it would re-render forever.
+  // Guarded on the comparison and depending on the VALUES it reads, never on
+  // `handlePlayerCountChange`: that is a component-body function whose identity
+  // changes every render, so depending on it would re-render forever.
   useEffect(() => {
     if (playerCount <= maxPlayers) return;
+    // Yield to the format guard above when it is firing in this same commit:
+    // it replaces the whole format and seats it at the replacement's own
+    // minimum, and clamping to the ceiling here would overwrite that. The next
+    // render re-evaluates both against the format that actually landed.
+    if (isP2P && formatConfig.min_players > P2P_MAX_PEERS) return;
     handlePlayerCountChange(maxPlayers);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playerCount, maxPlayers]);
+  }, [playerCount, maxPlayers, isP2P, formatConfig.min_players]);
 
   const handleDeckSizeChange = (deckSize: number) => {
     // Variant-preserving: the engine is the authority for whether the format's
@@ -1123,8 +1165,18 @@ export function HostSetup({
             </Field>
           )}
 
-          {/* Privacy / timing options — iOS-toggle rows (design mockup). */}
-          {!isP2P && (
+          {/* Privacy / timing options — iOS-toggle rows (design mockup).
+              "List in lobby" is offered in BOTH modes. Listing and transport
+              are independent: a P2P room hosted against a `LobbyOnly` broker —
+              which the official default anchor is — is registered through
+              `broker.registerHost({ public })` and appears in the public list
+              exactly as a server-run game does. Hiding this in P2P never
+              stopped that; it only removed the OPT-OUT, because `isPublic`
+              defaults to true. `startP2PHostingSession` still ANDs it with
+              `useBroker`, so against a `Full` anchor — which has no broker to
+              register with — the room is unlisted whatever this says, which is
+              also why the row is withheld outright in that case. */}
+          {!p2pListingUnavailable && (
             <OptionRow
               label={t("hostSetup.listInLobby")}
               on={isPublic}
