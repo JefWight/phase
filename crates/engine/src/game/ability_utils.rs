@@ -7721,25 +7721,6 @@ fn assign_targets_recursive(
         }
     }
 
-    // CR 115.1 + CR 601.2c: Mirror the `BecomeCopy` recipient slot pushed by
-    // `collect_target_slots`. The announced recipient is consumed into THIS
-    // node's `targets` BEFORE the generic copy-source target below, so
-    // `targets[0]` is the recipient and `targets[1]` the copy source — the
-    // exact order `become_copy::resolve` reads via
-    // `become_copy_copy_source_target_index`.
-    if ability.target_choice_timing == TargetChoiceTiming::Stack
-        && become_copy_recipient_slot_filter(&ability.effect).is_some()
-    {
-        if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
-            *next_target += 1;
-        } else if !ability.optional_targeting {
-            return Err(EngineError::InvalidAction(
-                "Missing required target".to_string(),
-            ));
-        }
-    }
-
     // CR 109.4 + CR 115.1: Mirror the companion-player slot pushed by
     // `collect_target_slots` for effects whose filters reference
     // `ControllerRef::TargetPlayer` (DamageAll, PutCounterAll, etc.). The
@@ -7773,6 +7754,29 @@ fn assign_targets_recursive(
     }
     if ability.target_choice_timing == TargetChoiceTiming::Stack
         && effect_needs_parent_target_combat_relation_slot(&ability.effect)
+    {
+        if let Some(target) = targets.get(*next_target) {
+            ability.targets.push(target.clone());
+            *next_target += 1;
+        } else if !ability.optional_targeting {
+            return Err(EngineError::InvalidAction(
+                "Missing required target".to_string(),
+            ));
+        }
+    }
+    // CR 115.1 + CR 601.2c: Mirror the `BecomeCopy` recipient slot pushed by
+    // `collect_target_slots`, at the SAME position in this ladder — after the
+    // companion/quantity/combat-relation slots and immediately before the
+    // generic copy-source consumption below. Position parity is what makes
+    // `targets[0]` the recipient and `targets[1]` the copy source, the exact
+    // order `become_copy::resolve` reads via
+    // `become_copy_copy_source_target_index`. (No `BecomeCopy` co-occurs with
+    // those three companion slots today — its copy-source filter never
+    // references `ControllerRef::TargetPlayer`, and it is neither a fight nor a
+    // quantity effect — so this is order-preserving now and stays correct if one
+    // ever does.)
+    if ability.target_choice_timing == TargetChoiceTiming::Stack
+        && become_copy_recipient_slot_filter(&ability.effect).is_some()
     {
         if let Some(target) = targets.get(*next_target) {
             ability.targets.push(target.clone());
@@ -8126,30 +8130,6 @@ fn assign_selected_slots_recursive(
         *next_slot += 1;
     }
 
-    // CR 115.1 + CR 601.2c: Mirror the `BecomeCopy` recipient slot for the
-    // ONE-SLOT-AT-A-TIME `ChooseTarget` walk (the path every AI game and the
-    // scenario driver take). Consumed BEFORE the generic copy-source target, so
-    // `targets[0]` is the recipient and `targets[1]` the copy source.
-    if ability.target_choice_timing == TargetChoiceTiming::Stack
-        && become_copy_recipient_slot_filter(&ability.effect).is_some()
-    {
-        let Some(selected_slot) = selected_slots.get(*next_slot) else {
-            return Err(EngineError::InvalidAction(
-                "Missing target selection".to_string(),
-            ));
-        };
-        match selected_slot {
-            Some(target) => ability.targets.push(target.clone()),
-            None if ability.optional_targeting => {}
-            None => {
-                return Err(EngineError::InvalidAction(
-                    "Missing required target".to_string(),
-                ));
-            }
-        }
-        *next_slot += 1;
-    }
-
     // CR 109.4 + CR 115.1: Mirror the companion-player slot pushed by
     // `collect_target_slots` for `ControllerRef::TargetPlayer` filters
     // (DamageAll, PutCounterAll, etc.). See `assign_targets_recursive`.
@@ -8194,6 +8174,33 @@ fn assign_selected_slots_recursive(
     }
     if ability.target_choice_timing == TargetChoiceTiming::Stack
         && effect_needs_parent_target_combat_relation_slot(&ability.effect)
+    {
+        let Some(selected_slot) = selected_slots.get(*next_slot) else {
+            return Err(EngineError::InvalidAction(
+                "Missing target selection".to_string(),
+            ));
+        };
+        match selected_slot {
+            Some(target) => ability.targets.push(target.clone()),
+            None if ability.optional_targeting => {}
+            None => {
+                return Err(EngineError::InvalidAction(
+                    "Missing required target".to_string(),
+                ));
+            }
+        }
+        *next_slot += 1;
+    }
+    // CR 115.1 + CR 601.2c: Mirror the `BecomeCopy` recipient slot for the
+    // ONE-SLOT-AT-A-TIME `ChooseTarget` walk (the path every AI game and the
+    // scenario driver take), at the SAME position in this ladder as in
+    // `collect_target_slots_inner` — after the companion/quantity/combat-relation
+    // slots and immediately before the generic copy-source consumption below.
+    // Position parity is what makes `targets[0]` the recipient and `targets[1]`
+    // the copy source, the order `become_copy::resolve` reads via
+    // `become_copy_copy_source_target_index`.
+    if ability.target_choice_timing == TargetChoiceTiming::Stack
+        && become_copy_recipient_slot_filter(&ability.effect).is_some()
     {
         let Some(selected_slot) = selected_slots.get(*next_slot) else {
             return Err(EngineError::InvalidAction(

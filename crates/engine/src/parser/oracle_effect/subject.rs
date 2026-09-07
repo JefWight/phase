@@ -3949,22 +3949,30 @@ pub(super) fn static_affected_for_application(application: &SubjectApplication) 
 /// **Why the copy source gates the announced reading.** An announced recipient
 /// claims declared-target slot 0, which shifts the copy source to slot 1 (see
 /// `become_copy_copy_source_target_index`). That shift is only sound when the
-/// copy source ITSELF claims a declared slot. When the copy source is a context
-/// ref — Cytoshape's and Polymorphous Rush's `ParentTarget` ("that creature",
-/// naming a creature chosen by an earlier clause), The Myriad Pools' and Kaya's
-/// `TriggeringSource` — it is resolved from chain/event context and occupies no
-/// slot, so slot 1 does not exist and the resolver would find no copy source at
-/// all. Those cards keep the pre-existing `Source` reading: they were already an
-/// honest gap before this axis existed, and silently converting that gap into a
-/// resolution-time failure would be strictly worse (CLAUDE.md: an unreadable
-/// shape must stay visible, not be consumed). Sizing the change to exactly the
-/// class it fixes also keeps its blast radius equal to its claim.
+/// copy source ITSELF claims a declared slot. Two filter shapes claim none, and
+/// this predicate must mirror BOTH arms of the runtime authority
+/// (`game::triggers::extract_target_filter_from_effect`) or the invariant is
+/// weaker than it reads:
+///
+/// - a context ref — Cytoshape's and Polymorphous Rush's `ParentTarget` ("that
+///   creature", naming a creature chosen by an earlier clause), The Myriad
+///   Pools' and Kaya's `TriggeringSource` — is resolved from chain/event
+///   context;
+/// - `TargetFilter::Any`, which on every effect except the damage family is the
+///   "broadcast at resolution, no declared target" sentinel.
+///
+/// In either case slot 1 does not exist and the resolver would find no copy
+/// source at all. Those cards keep the pre-existing `Source` reading: they were
+/// already an honest gap before this axis existed, and silently converting that
+/// gap into a resolution-time failure would be strictly worse (CLAUDE.md: an
+/// unreadable shape must stay visible, not be consumed). Sizing the change to
+/// exactly the class it fixes also keeps its blast radius equal to its claim.
 fn copy_recipient_for_application(
     application: &SubjectApplication,
     copy_source: &TargetFilter,
 ) -> CopyRecipient {
     if let Some(target) = application.target.clone() {
-        if copy_source.is_context_ref() {
+        if !copy_source_claims_a_declared_slot(copy_source) {
             return crate::types::ability::CopyRecipient::Source;
         }
         return crate::types::ability::CopyRecipient::targeted(target);
@@ -3973,6 +3981,17 @@ fn copy_recipient_for_application(
         TargetFilter::SelfRef => crate::types::ability::CopyRecipient::Source,
         filter => crate::types::ability::CopyRecipient::Untargeted(filter),
     }
+}
+
+/// CR 115.1: does a `BecomeCopy` copy-source filter claim a declared target slot?
+///
+/// Mirrors the two suppression arms `extract_target_filter_from_effect` applies
+/// to this effect: the `Any` broadcast sentinel (whose damage-family exception
+/// cannot reach `BecomeCopy`) and any context ref. Keep in lockstep with that
+/// function — if it ever suppresses a third shape for `BecomeCopy`, an announced
+/// recipient would again shift the copy source onto a slot that does not exist.
+fn copy_source_claims_a_declared_slot(copy_source: &TargetFilter) -> bool {
+    !matches!(copy_source, TargetFilter::Any) && !copy_source.is_context_ref()
 }
 
 fn merge_partial_type_phrase_filter(filter: TargetFilter, remainder: &str) -> TargetFilter {
