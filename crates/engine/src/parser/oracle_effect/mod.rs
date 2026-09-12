@@ -36899,14 +36899,12 @@ pub(crate) fn parse_effect_chain_ir(
                         .flatten()
                 }),
             card_name: ctx.card_name.clone(),
-            // CR 608.2k: the DEMONSTRATIVE-scoped antecedent is a property of
-            // the whole trigger body (the Kashi-Tribe "tap that creature and it
-            // doesn't untap" tail lives in a sub-ability chunk), so it
-            // propagates like `plural_object_pronoun_ref`. It shares
-            // `object_pronoun_ref`'s first rung: CR 608.2k's nearest-antecedent
-            // rule means a typed referent introduced by an EARLIER chunk in this
-            // same chain outranks the outer trigger condition, and a
-            // demonstrative naming it binds that nearer choice.
+            // The DEMONSTRATIVE-scoped antecedent is a property of the whole
+            // trigger body (the Kashi-Tribe "tap that creature and it doesn't
+            // untap" tail lives in a sub-ability chunk), so it propagates like
+            // `plural_object_pronoun_ref`. A typed referent introduced by an
+            // earlier chunk is more specific than the outer trigger-condition
+            // context, so a later demonstrative retains that chain-local binding.
             //
             // The `binds_source_counter_pronoun` rung is deliberately absent:
             // that gate exists for the bare "it" pronoun's source-counter class
