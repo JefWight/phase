@@ -113,9 +113,163 @@ fn active_damage_trigger_demonstrative_binds_the_damage_recipient() {
     }
 }
 
-/// CR 120.1: the PLAYER-recipient sibling must be untouched — "deals combat
-/// damage to a player" names no object recipient, so the object anaphor pin must
-/// not fire and "that player" keeps its own player-scope binding.
+/// CR 120.1: the PLURAL active-voice verb ("creatures you control **deal**
+/// combat damage…") is the same grammar as the singular. The trigger parser has
+/// always collapsed `deal`/`deals` into one alternative, so an antecedent scan
+/// that recognized only `deals` would classify these as `DamageDone` while
+/// leaving the recipient unpinned — the trigger fires and the effect resolves
+/// against nothing, which is the exact failure this whole class is about.
+///
+/// Both articles are exercised: `parse_object_recipient_filter` requires an
+/// `"a "`/`"an "` article, and `an` is the rarer path.
+#[test]
+fn plural_active_damage_verb_binds_the_damage_recipient() {
+    for (label, oracle) in [
+        (
+            "plural + a",
+            "Whenever creatures you control deal combat damage to a creature, destroy that creature.",
+        ),
+        (
+            "plural + an",
+            "Whenever creatures you control deal combat damage to an artifact creature, destroy that creature.",
+        ),
+        (
+            "singular + an",
+            "Whenever this creature deals combat damage to an artifact creature, destroy that creature.",
+        ),
+        (
+            "plural, noncombat, exile",
+            "Whenever Elves you control deal damage to a creature, exile that creature.",
+        ),
+    ] {
+        let effect = trigger_body_effect(oracle, "Plural Damage Probe");
+        assert_eq!(
+            effect_subject(&effect),
+            &TargetFilter::EventTarget,
+            "{label}: the plural verb must pin the recipient exactly as the singular does"
+        );
+    }
+}
+
+/// CR 608.2k: the demonstrative pin is scoped to the damage-RECIPIENT
+/// provenance. A SPELL-CAST trigger pins the cast spell for BARE PRONOUNS, but
+/// its "that card" demonstrative belongs to the replacement clause's own
+/// grammar — "exile that card with N counters on it **instead of putting it into
+/// your graveyard as it resolves**" (Gandalf of the Secret Fire, Goliath
+/// Daydreamer).
+///
+/// Widening the demonstrative to every pin provenance reclassified that clause
+/// and silently swallowed the replacement, so this is a REGRESSION RATCHET: the
+/// replacement must keep parsing, and the clause must not degrade into a
+/// swallowed/unimplemented shape.
+#[test]
+fn spell_cast_trigger_demonstrative_is_not_captured_by_the_recipient_pin() {
+    for (card, oracle) in [
+        (
+            "Goliath Daydreamer",
+            "Whenever you cast an instant or sorcery spell from your hand, exile that card with a dream counter on it instead of putting it into your graveyard as it resolves.",
+        ),
+        (
+            "Gandalf of the Secret Fire",
+            "Whenever you cast an instant or sorcery spell from your hand during an opponent's turn, exile that card with three time counters on it instead of putting it into your graveyard as it resolves.",
+        ),
+    ] {
+        let effect = trigger_body_effect(oracle, card);
+        let Effect::ChangeZone {
+            target,
+            origin,
+            destination,
+            ..
+        } = &effect
+        else {
+            panic!("{card}: expected a ChangeZone body, got {effect:?}");
+        };
+        assert_eq!(
+            target,
+            &TargetFilter::ParentTarget,
+            "{card}: a spell-cast demonstrative keeps its parent-target binding"
+        );
+        // CR 614: "instead of putting it into your graveyard as it resolves" is
+        // the replacement, modelled as a Graveyard -> Exile redirect. If the
+        // demonstrative is rebound, the clause reclassifies and this origin is
+        // lost -- which is how it showed up as a newly swallowed replacement.
+        assert_eq!(
+            origin,
+            &Some(Zone::Graveyard),
+            "{card}: the replaced graveyard origin must survive"
+        );
+        assert_eq!(destination, &Zone::Exile, "{card}: exiled instead");
+    }
+}
+
+/// CR 120.1 + CR 510.4 + CR 701.8a: the PLURAL verb end to end, not just in the
+/// parser. An observer with "Whenever creatures you control **deal** combat
+/// damage to a creature, destroy that creature" must destroy the attacker that a
+/// *different* creature damaged.
+///
+/// The parser-level plural test above proves the pin is set; this proves the
+/// pinned referent actually resolves to an object at runtime. Both are needed:
+/// the original defect in this class parsed "correctly" by every AST assertion
+/// and still resolved against nothing.
+#[test]
+fn plural_active_damage_trigger_destroys_the_damaged_creature_at_runtime() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let observer = {
+        let mut b = scenario.add_creature(P0, "Plural Observer", 2, 2);
+        b.from_oracle_text(
+            "Whenever creatures you control deal combat damage to a creature, destroy that creature.",
+        );
+        b.id()
+    };
+    let blocker = {
+        let mut b = scenario.add_creature(P0, "First Striker", 1, 1);
+        b.first_strike();
+        b.id()
+    };
+    let attacker = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+
+    let mut runner = scenario.build();
+    runner.state_mut().active_player = P1;
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(attacker, AttackTarget::Player(P0))])
+        .expect("declare attackers");
+    for _ in 0..8 {
+        if runner.waiting_for_kind() == "DeclareBlockers" {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority into the declare-blockers step");
+    }
+    runner
+        .declare_blockers(&[(blocker, attacker)])
+        .expect("declare blockers");
+
+    let outcome = runner.combat_damage();
+
+    assert_eq!(
+        outcome.zone_of(attacker),
+        Zone::Graveyard,
+        "the plural-verb trigger must destroy the damaged attacker"
+    );
+    assert_eq!(
+        outcome.zone_of(blocker),
+        Zone::Battlefield,
+        "CR 510.4: the attacker dies in the first-strike step and never strikes back"
+    );
+    assert_eq!(
+        outcome.zone_of(observer),
+        Zone::Battlefield,
+        "the observer is not its own referent"
+    );
+}
+
+/// CR 120.1 + CR 120.3: the PLAYER-recipient sibling must be untouched — "deals
+/// combat damage to a player" names no object recipient, so the object anaphor
+/// pin must not fire and "that player" keeps its own player-scope binding.
 #[test]
 fn player_recipient_damage_trigger_keeps_its_player_anaphor() {
     let abilities = engine::parser::oracle::parse_oracle_text(

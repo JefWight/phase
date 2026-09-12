@@ -986,10 +986,10 @@ pub fn parse_target_with_syntax<'a>(
             // untargeted object … previously referred to by that ability's …
             // trigger condition" — outranks the generic `ParentTarget` lift
             // below, exactly as it does for the bare-pronoun family in
-            // `resolve_pronoun_target` (which consults this same field before
-            // its own `ctx.subject` match). CR 608.2k draws no distinction
-            // between a demonstrative and a pronoun naming that object, so the
-            // two must not bind differently.
+            // `resolve_pronoun_target` (which consults its own pin before its
+            // `ctx.subject` match). CR 608.2k draws no distinction between a
+            // demonstrative and a pronoun naming that object, so where both may
+            // name it, the two must not bind differently.
             //
             // This branch previously mirrored only `resolve_pronoun_target`'s
             // `ctx.subject` consultation (the `CostPaidObject` arm below) and
@@ -999,7 +999,15 @@ pub fn parse_target_with_syntax<'a>(
             // "it" to the damaged creature and "that creature" to a parent
             // target the untargeted trigger never had — leaving the tap with no
             // subject at all. Completing the mirror unifies them.
-            if let Some(pinned) = ctx.object_pronoun_ref.clone() {
+            //
+            // Reads the DEMONSTRATIVE-scoped pin, not the wider bare-pronoun
+            // pin. The two provenances are not interchangeable here: a
+            // spell-cast body's "exile THAT CARD ... instead of putting it into
+            // your graveyard as it resolves" (Gandalf of the Secret Fire,
+            // Goliath Daydreamer) is a replacement clause whose demonstrative is
+            // consumed by its own grammar, and binding it to the cast spell
+            // reclassifies the clause into a silently swallowed replacement.
+            if let Some(pinned) = ctx.demonstrative_object_ref.clone() {
                 return (pinned, rem, syntax);
             }
             // CR 608.2c + CR 701.21a: a gated "If you do," clause whose
