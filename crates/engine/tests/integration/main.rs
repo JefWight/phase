@@ -12,6 +12,7 @@ mod ability_block_display_clone_gate;
 mod ability_cost_block_readout;
 mod abundance_optional_draw_replacement;
 mod action_rejection;
+mod active_damage_trigger_recipient_anaphor;
 mod ad_nauseam_repeat;
 mod adamant_enters_with_leading_if_gate;
 mod adapter_contract_fixtures;

@@ -982,6 +982,26 @@ pub fn parse_target_with_syntax<'a>(
             {
                 return (slot_filter, &text[lower.len() - slot_rest.len()..], syntax);
             }
+            // CR 608.2k: a pinned untargeted antecedent — "the specific
+            // untargeted object … previously referred to by that ability's …
+            // trigger condition" — outranks the generic `ParentTarget` lift
+            // below, exactly as it does for the bare-pronoun family in
+            // `resolve_pronoun_target` (which consults this same field before
+            // its own `ctx.subject` match). CR 608.2k draws no distinction
+            // between a demonstrative and a pronoun naming that object, so the
+            // two must not bind differently.
+            //
+            // This branch previously mirrored only `resolve_pronoun_target`'s
+            // `ctx.subject` consultation (the `CostPaidObject` arm below) and
+            // not its pin consultation, so one sentence could resolve the same
+            // referent two ways: the Kashi-Tribe cycle's "tap THAT CREATURE and
+            // IT doesn't untap during its controller's next untap step" bound
+            // "it" to the damaged creature and "that creature" to a parent
+            // target the untargeted trigger never had — leaving the tap with no
+            // subject at all. Completing the mirror unifies them.
+            if let Some(pinned) = ctx.object_pronoun_ref.clone() {
+                return (pinned, rem, syntax);
+            }
             // CR 608.2c + CR 701.21a: a gated "If you do," clause whose
             // antecedent is a resolution-time choice with no target concept
             // of its own (`Effect::Sacrifice`) seeds `ctx.subject` with

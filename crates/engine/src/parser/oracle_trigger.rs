@@ -10892,6 +10892,38 @@ fn parse_passive_dealt_damage(input: &str) -> OracleResult<'_, ()> {
     Ok((input, ()))
 }
 
+/// CR 120.1 + CR 120.3 + CR 608.2k: the ACTIVE-voice damage verb phrase that
+/// names an OBJECT recipient — "deals [combat|noncombat|excess] [N or more]
+/// damage to <object>".
+///
+/// The voice dual of [`parse_passive_dealt_damage`]. In the active voice the
+/// grammatical subject is the damage SOURCE (CR 120.1: "an object that deals
+/// damage is the source of that damage"), so the subject is *not* the object a
+/// later anaphor names. What the condition introduces as the nearest object
+/// antecedent is the RECIPIENT named by the `"to <object>"` tail — "Whenever a
+/// Sliver deals combat damage to a creature, destroy THAT CREATURE" destroys the
+/// damaged creature, never the Sliver that dealt the damage.
+///
+/// Composed entirely from the two combinators the `DamageDone` trigger grammar
+/// already uses for this exact tail — `parse_damage_predicate_tail` (damage
+/// class × amount threshold) and `parse_object_recipient_filter` (the recipient
+/// axis) — so the antecedent recognized here is by construction the same
+/// recipient `try_parse_source_deals_damage_trigger` stores in
+/// `TriggerDefinition::valid_target`, and both move together when either axis
+/// gains a form.
+///
+/// `parse_object_recipient_filter` is what makes this OBJECT-only: it requires
+/// an `"a "`/`"an "` article plus a type phrase and explicitly declines the
+/// `"creature or player"` / `"creature or opponent"` disjunctions, so a
+/// player-recipient trigger ("deals combat damage to a player") never reaches
+/// here and keeps its own `TriggeringPlayer` / `DefendingPlayer` antecedents.
+fn parse_active_deals_damage_to_object(input: &str) -> OracleResult<'_, ()> {
+    let (input, _) = tag("deals ").parse(input)?;
+    let (input, _) = parse_damage_predicate_tail(input)?;
+    let (input, _) = parse_object_recipient_filter(input)?;
+    Ok((input, ()))
+}
+
 fn trigger_object_pronoun_ref_for_condition(
     condition_text: &str,
     trigger_subject: &TargetFilter,
@@ -10955,6 +10987,42 @@ fn trigger_object_pronoun_ref_for_condition(
             parse_passive_dealt_damage,
         )
         .is_some()
+    {
+        return Some(TargetFilter::EventTarget);
+    }
+
+    // CR 608.2k + CR 120.1 + CR 120.3: an ACTIVE-voice damage trigger condition
+    // that names an OBJECT recipient ("whenever <source> deals combat damage to a
+    // creature") introduces that RECIPIENT as the effect body's untargeted object
+    // antecedent — CR 608.2k's "specific untargeted object … previously referred
+    // to by that ability's … trigger condition". "Destroy that creature" /
+    // "exile that creature" / "tap that creature" / "put a -1/-1 counter on that
+    // creature" all name the damaged permanent (Phage the Untouchable, Toxin
+    // Sliver, Stinkweed Imp, Pit Spawn, Sword of Kaldra, Kaldra Compleat, the
+    // Kashi-Tribe and basilisk cycles, Obelisk Spider, Sosuke).
+    //
+    // Without the pin, the demonstrative fell through to the generic anaphor
+    // grammar and bound `ParentTarget`. An untargeted damage trigger has no
+    // chosen target, and the parentless-`ParentTarget` event fallback in
+    // `game/targeting.rs` carries no `DamageDealt` arm, so the referent resolved
+    // to NOTHING and every effect in the class silently did nothing. The
+    // subject-derived `TriggeringSource` fallback is equally wrong here and worse
+    // for being plausible: on an active-voice condition the event's `source_id`
+    // is the damage DEALER, so "destroy that creature" would destroy the
+    // attacking creature's own controller's permanent.
+    //
+    // Unlike the passive-voice branch above, this one is NOT gated on the subject
+    // being non-self-referential. Voice is exactly what makes that gate
+    // unnecessary: in the passive voice the subject IS the recipient (so a
+    // self-scoped enrage trigger keeps the more precise `SelfRef`), while in the
+    // active voice the subject is the source and the recipient is a DIFFERENT
+    // object — Phage's "whenever Phage deals combat damage to a creature" has a
+    // self-referential subject and still means the damaged creature.
+    if crate::parser::oracle_nom::primitives::scan_at_word_boundaries(
+        after_keyword,
+        parse_active_deals_damage_to_object,
+    )
+    .is_some()
     {
         return Some(TargetFilter::EventTarget);
     }
