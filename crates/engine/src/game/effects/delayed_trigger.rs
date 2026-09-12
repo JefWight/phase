@@ -283,12 +283,15 @@ pub fn resolve(
         bind_tracked_set_to_ability_chain(&mut delayed_ability, real_id);
     }
 
-    // CR 603.7c: A delayed trigger whose inner effect targets the trigger's
-    // source object via TriggeringSource or ParentTarget must snapshot that
-    // object at creation time. At creation, current_trigger_event =
-    // ZoneChanged { dying_creature } and TriggeringSource resolves correctly.
+    // CR 603.7c: A delayed trigger whose inner effect names an object from its
+    // CREATION event — via either event-subject anaphor (`TriggeringSource`,
+    // `EventTarget`; see `EVENT_SUBJECT_ANAPHORS`) or via ParentTarget — must
+    // snapshot that object at creation time. At creation, current_trigger_event =
+    // ZoneChanged { dying_creature } and TriggeringSource resolves correctly;
+    // for an "at end of combat" destroy it is DamageDealt { target } and
+    // EventTarget resolves correctly.
     //
-    // Without the snapshot, at end-step firing:
+    // Without the snapshot, at end-step / end-of-combat firing:
     //   current_trigger_event = PhaseChanged { End }
     //   - is_pure_event_context_filter(TriggeringSource) = true → block IS entered
     //   - resolve_event_context_target returns None (PhaseChanged carries no
@@ -299,7 +302,8 @@ pub fn resolve(
     //   - second resolve_event_context_target attempt → None
     //   - final ability.targets.clone() fallback returns [] (empty snapshot)
     //     → the zone move silently skips (bugs #2883 Grave Betrayal,
-    //       #2886 Liliana emblem)
+    //       #2886 Liliana emblem), and the delayed destroy silently skips
+    //       (#4229 Ohran Viper, Lowland/Thicket/Simic Basilisk).
     //
     // With the snapshot: delayed_ability.targets = [dying_creature] at
     // creation, and the final fallback correctly returns [dying_creature].
@@ -307,10 +311,10 @@ pub fn resolve(
     // CR 603.7c: See separate branch for LastCreated snapshots.
     //
     // Event-delayed triggers, including one-shot `WhenNextEvent`, must not
-    // snapshot TriggeringSource at creation: each firing resolves it from the
-    // event that actually fired the trigger. Only phase-delayed triggers need
-    // the creation-time fallback because their later phase event has no object
-    // subject.
+    // snapshot an event-subject anaphor at creation: each firing resolves it
+    // from the event that actually fired the trigger. Only phase-delayed
+    // triggers need the creation-time fallback because their later phase event
+    // has no object subject.
     //
     // CR 603.7b: Computed ONCE here and reused for the creation-snapshot gate, the
     // `DelayedTrigger.one_shot` field. `condition`'s variant is not reassigned
@@ -343,29 +347,64 @@ pub fn resolve(
     //    reads a condition both binders have already rewritten and yields
     //    `false` for every card in the class.
     //
-    // Scoped to the ParentTarget arm: the TriggeringSource arm re-resolves from
-    // the firing event and already carries a creation-time zone guard
-    // (`stamp_triggering_source_origins_in_ability_chain`, below); the
-    // LastCreated arm names tokens, which cease to exist on a zone change
-    // (CR 111.7) rather than returning as a new incarnation.
+    // Scoped to the ParentTarget arm: the event-subject arm computes its own
+    // pins inline against the same operative test (see below); the LastCreated
+    // arm names tokens, which cease to exist on a zone change (CR 111.7) rather
+    // than returning as a new incarnation.
     let creation_time_provenance = condition_uses_creation_time_provenance(&condition);
-    let (snapshot_targets, target_pins) = if creation_time_provenance
-        && super::ability_refs_triggering_source(&delayed_ability)
-    {
-        // CR 603.7c: TriggeringSource always reads the event context (the dying
-        // creature from the ZoneChanged event), not the parent ability's chosen
-        // targets. Bypasses parent_target_snapshot's ability.targets early-return,
-        // which is correct for ParentTarget (Flickerwisp) but wrong here.
-        (
-            crate::game::targeting::resolve_event_context_target(
-                state,
-                &crate::types::ability::TargetFilter::TriggeringSource,
-                ability.source_id,
-            )
-            .map(|t| vec![t])
-            .unwrap_or_default(),
-            Vec::new(),
-        )
+    let event_subject_anaphor = creation_time_provenance
+        .then(|| super::ability_event_subject_anaphor(&delayed_ability))
+        .flatten();
+    let (snapshot_targets, target_pins) = if let Some(anaphor) = event_subject_anaphor {
+        // CR 608.2k: An event-subject anaphor always reads the event context —
+        // `TriggeringSource` the event's subject (the dying creature of a
+        // ZoneChanged), `EventTarget` its object slot (the damaged creature of
+        // a DamageDealt) — never the parent ability's chosen targets. Bypasses
+        // parent_target_snapshot's ability.targets early-return, which is
+        // correct for ParentTarget (Flickerwisp) but wrong here.
+        //
+        // Resolving the ANAPHOR THE CHAIN ACTUALLY NAMES, rather than a
+        // hardcoded `TriggeringSource`, is what keeps the two members of the
+        // set from drifting: CR 120.1 makes the subject the damage DEALER, so
+        // snapshotting `TriggeringSource` for an `EventTarget` chain would
+        // destroy the attacking creature instead of the one it damaged.
+        let targets =
+            crate::game::targeting::resolve_event_context_target(state, anaphor, ability.source_id)
+                .map(|t| vec![t])
+                .unwrap_or_default();
+        // CR 400.7 + CR 603.7c: "if that object leaves the battlefield and
+        // returns, it becomes a new object and the ability no longer affects
+        // it." Pin the snapshotted referent to the incarnation it has right now
+        // so an "at end of combat" destroy cannot hit a creature that was
+        // damaged, then blinked or bounced, and came back before the trigger
+        // fired. `live_object_targets` (the list `destroy::resolve` reads once
+        // `targets` is non-empty) drops a stale pin.
+        //
+        // Scoped to the referents the creation event did NOT move — which is
+        // the same operative test `condition_expects_referent_move` applies on
+        // the ParentTarget arm below. A `TriggeringSource` snapshot taken off a
+        // ZoneChanged/Milled event names an object that event just moved, so it
+        // is already a new incarnation at creation and a pin would make it inert
+        // forever (#2883 Grave Betrayal, #2886 Liliana emblem); its guard is the
+        // `ChangeZone.origin` stamp below instead. A `DamageDealt` event moves
+        // nothing, so its recipient is pinnable.
+        let creation_event_moved_this_referent = matches!(anaphor, TargetFilter::TriggeringSource)
+            && triggering_source_destination_zone(state).is_some();
+        let pins = if creation_event_moved_this_referent {
+            Vec::new()
+        } else {
+            targets
+                .iter()
+                .filter_map(|target| match target {
+                    TargetRef::Object(id) => state
+                        .objects
+                        .get(id)
+                        .map(crate::types::identifiers::ObjectIncarnationRef::from_object),
+                    TargetRef::Player(_) => None,
+                })
+                .collect()
+        };
+        (targets, pins)
     } else if super::ability_refs_parent_target(&delayed_ability) {
         let targets = parent_target_snapshot(state, ability);
         let pins =
@@ -409,6 +448,14 @@ pub fn resolve(
     // TriggeringSource destination zone only for phase-delayed triggers, whose
     // later firing event has no source and relies on the creation-time snapshot.
     // Event-delayed triggers re-resolve TriggeringSource from their firing event.
+    //
+    // Deliberately NARROWER than the snapshot above, which covers both
+    // `EVENT_SUBJECT_ANAPHORS`: `triggering_source_destination_zone` reads the
+    // destination of the event's own moved object (`ZoneChanged.to` /
+    // `Milled.to`). That is the zone the SUBJECT landed in, which says nothing
+    // about where an `EventTarget` referent is — on a `DamageDealt` event there
+    // is no destination at all. Stamping it onto an `EventTarget` chain would
+    // invent a zone guard the creation event never established.
     if creation_time_provenance && super::ability_refs_triggering_source(&delayed_ability) {
         if let Some(zone) = triggering_source_destination_zone(state) {
             stamp_triggering_source_origins_in_ability_chain(&mut delayed_ability, zone);

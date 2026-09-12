@@ -1,0 +1,231 @@
+//! CR 603.7c + CR 608.2k: a PHASE-delayed trigger that names an object carried
+//! by its CREATION event must snapshot that object at creation time.
+//!
+//! "Whenever <source> deals combat damage to a creature, destroy that creature
+//! AT END OF COMBAT" lowers to
+//! `CreateDelayedTrigger { condition: AtNextPhase(EndCombat), effect: Destroy {
+//! target: EventTarget } }`. `EventTarget` resolves out of
+//! `state.current_trigger_event`, which at the end-of-combat step is the phase
+//! change — it carries no object, so the referent resolved to nothing and the
+//! destroy silently did nothing (issue #4229, Ohran Viper).
+//!
+//! `delayed_trigger::resolve` already creation-time-snapshots the OTHER
+//! event-subject anaphor, `TriggeringSource`, for exactly this reason.
+//! `EventTarget` is its CR 120.3 recipient counterpart and was simply never a
+//! member of that snapshot pass.
+//!
+//! These are building-block tests: the snapshot is keyed on the anaphor, not on
+//! a card, so the coverage below spans the self-referential source (Ohran
+//! Viper), a source filter that is NOT the damage dealer (the Sliver class,
+//! where the trigger source watches a third object deal the damage), and the
+//! granted-ability form (Simic Basilisk), whose trigger source is the creature
+//! that received the grant rather than the granter.
+
+use super::rules::{GameScenario, Phase, P0, P1};
+use engine::game::combat::AttackTarget;
+use engine::game::scenario::GameRunner;
+use engine::types::actions::GameAction;
+use engine::types::identifiers::ObjectId;
+use engine::types::mana::{ManaType, ManaUnit};
+use engine::types::zones::Zone;
+
+const OHRAN_VIPER: &str =
+    "Whenever this creature deals combat damage to a creature, destroy that creature at end of combat.";
+const DELAYED_SLIVER: &str =
+    "Whenever a Sliver deals combat damage to a creature, destroy that creature at end of combat.";
+const SIMIC_BASILISK_GRANT: &str = "{1}{G}: Until end of turn, target creature with a +1/+1 counter on it gains \"Whenever this creature deals combat damage to a creature, destroy that creature at end of combat.\"";
+
+/// CR 400.1: the zone an object currently occupies, read straight off the live
+/// runner (`Outcome::zone_of` only sees the snapshot taken at its own call).
+fn zone_of(runner: &GameRunner, object: ObjectId) -> Zone {
+    runner.state().objects[&object].zone
+}
+
+/// One unit of untapped, unrestricted mana of `color`.
+fn mana(color: ManaType) -> ManaUnit {
+    ManaUnit::new(color, ObjectId(0), false, vec![])
+}
+
+/// Drive the declare-blockers step: pass priority until the engine surfaces it.
+fn pass_into_declare_blockers(runner: &mut GameRunner) {
+    for _ in 0..8 {
+        if runner.waiting_for_kind() == "DeclareBlockers" {
+            return;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority into the declare-blockers step");
+    }
+    panic!("never reached the declare-blockers step");
+}
+
+/// CR 511.1 + CR 603.7c: the reported board state (issue #4229). Ohran Viper
+/// attacks, a 0/6 Wall blocks. The Viper deals 1 combat damage to the Wall — not
+/// lethal, so only the delayed destroy can remove it — and takes 0 back. At the
+/// END OF COMBAT step the delayed trigger fires and must destroy the Wall it
+/// damaged.
+#[test]
+fn ohran_viper_destroys_the_damaged_creature_at_end_of_combat() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let viper = {
+        let mut b = scenario.add_creature(P0, "Ohran Viper", 1, 2);
+        b.from_oracle_text(OHRAN_VIPER);
+        b.id()
+    };
+    let wall = scenario.add_creature(P1, "Wall of Stone", 0, 6).id();
+
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(viper, AttackTarget::Player(P1))])
+        .expect("declare attackers");
+    pass_into_declare_blockers(&mut runner);
+    runner
+        .declare_blockers(&[(wall, viper)])
+        .expect("declare blockers");
+
+    let damage = runner.combat_damage();
+    assert_eq!(
+        damage.zone_of(wall),
+        Zone::Battlefield,
+        "CR 704.5g: 1 damage is not lethal to a 0/6 — the Wall may only die to the \
+         delayed destroy, so this test would pass vacuously if it died here"
+    );
+
+    // CR 511.1: the delayed trigger fires at the beginning of the end-of-combat
+    // step; drive past it so the trigger resolves.
+    runner.advance_to_phase(Phase::PostCombatMain);
+
+    assert_eq!(
+        zone_of(&runner, wall),
+        Zone::Graveyard,
+        "CR 603.7c: the delayed destroy must affect the creature the trigger's \
+         CREATION event damaged, snapshotted at creation time"
+    );
+    assert_eq!(
+        zone_of(&runner, viper),
+        Zone::Battlefield,
+        "CR 120.1: the damage DEALER is not its own referent"
+    );
+}
+
+/// CR 120.3 + CR 603.7c: the snapshot must bind the event's damage RECIPIENT,
+/// not the trigger source and not the ability's source object. Here the trigger
+/// source (a 3/3 Sliver lord that never fights) watches a DIFFERENT Sliver deal
+/// the combat damage, so a snapshot keyed on `ability.source_id` or on
+/// `TriggeringSource` would destroy the wrong creature — or nothing at all.
+#[test]
+fn delayed_sliver_trigger_destroys_the_recipient_not_the_source() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let watcher = {
+        let mut b = scenario.add_creature(P0, "Toxin Sliver", 3, 3);
+        b.with_subtypes(vec!["Sliver"]);
+        b.from_oracle_text(DELAYED_SLIVER);
+        b.id()
+    };
+    let dealer = {
+        let mut b = scenario.add_creature(P0, "Sidewinder Sliver", 1, 1);
+        b.with_subtypes(vec!["Sliver"]);
+        b.id()
+    };
+    let blocker = scenario.add_creature(P1, "Wall of Stone", 0, 6).id();
+
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(dealer, AttackTarget::Player(P1))])
+        .expect("declare attackers");
+    pass_into_declare_blockers(&mut runner);
+    runner
+        .declare_blockers(&[(blocker, dealer)])
+        .expect("declare blockers");
+
+    let damage = runner.combat_damage();
+    assert_eq!(
+        damage.zone_of(blocker),
+        Zone::Battlefield,
+        "1 damage is not lethal to a 0/6 — guards against a vacuous pass"
+    );
+
+    runner.advance_to_phase(Phase::PostCombatMain);
+
+    assert_eq!(
+        zone_of(&runner, blocker),
+        Zone::Graveyard,
+        "CR 120.3: the delayed destroy names the damage RECIPIENT"
+    );
+    assert_eq!(
+        zone_of(&runner, dealer),
+        Zone::Battlefield,
+        "CR 120.1: the damage dealer must survive — `TriggeringSource` is the wrong anaphor"
+    );
+    assert_eq!(
+        zone_of(&runner, watcher),
+        Zone::Battlefield,
+        "the trigger source is not its own referent"
+    );
+}
+
+/// CR 603.7c + CR 113.3 + CR 611.2c: the GRANTED form (Simic Basilisk). The
+/// trigger is printed on the grantor's activated ability and granted to a
+/// DIFFERENT creature, so the delayed trigger created at combat damage belongs
+/// to the GRANTEE. The creation-time snapshot must read the grantee's own
+/// creation event — anything keyed on the grantor (which never fought) resolves
+/// to nothing.
+#[test]
+fn granted_delayed_damage_trigger_snapshots_its_own_creation_event() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, vec![mana(ManaType::Green), mana(ManaType::Green)]);
+
+    // The grantor stays home: it never attacks and never deals damage.
+    let grantor = {
+        let mut b = scenario.add_creature(P0, "Simic Basilisk", 2, 2);
+        b.from_oracle_text(SIMIC_BASILISK_GRANT);
+        b.id()
+    };
+    // CR 122.1: the grant targets "creature with a +1/+1 counter on it".
+    let grantee = {
+        let mut b = scenario.add_creature(P0, "Grafted Creature", 1, 1);
+        b.with_plus_counters(1);
+        b.id()
+    };
+    let blocker = scenario.add_creature(P1, "Wall of Stone", 0, 6).id();
+
+    let mut runner = scenario.build();
+    runner.activate(grantor, 0).target_object(grantee).resolve();
+
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(grantee, AttackTarget::Player(P1))])
+        .expect("declare attackers");
+    pass_into_declare_blockers(&mut runner);
+    runner
+        .declare_blockers(&[(blocker, grantee)])
+        .expect("declare blockers");
+
+    let damage = runner.combat_damage();
+    assert_eq!(
+        damage.zone_of(blocker),
+        Zone::Battlefield,
+        "2 damage is not lethal to a 0/6 — guards against a vacuous pass"
+    );
+
+    runner.advance_to_phase(Phase::PostCombatMain);
+
+    assert_eq!(
+        zone_of(&runner, blocker),
+        Zone::Graveyard,
+        "CR 603.7c: a granted delayed trigger snapshots the recipient from its own \
+         creation event"
+    );
+    assert_eq!(
+        zone_of(&runner, grantor),
+        Zone::Battlefield,
+        "the grantor never fought and is not its own referent"
+    );
+}

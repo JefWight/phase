@@ -8405,42 +8405,89 @@ pub(crate) fn filter_refs_parent_target(filter: &TargetFilter) -> bool {
     }
 }
 
-/// True if the filter directly or recursively references `TargetFilter::TriggeringSource`.
+/// CR 608.2k: The EVENT-SUBJECT anaphors — the target filters that name an
+/// object carried by the trigger EVENT itself rather than a target a player
+/// chose. There are exactly two, and they are the two halves of the same
+/// grammatical relation on a `DamageDealt`/`ZoneChanged`/… event:
+///
+/// * `TriggeringSource` — the event's SUBJECT (CR 120.1: on an active-voice
+///   damage condition, the damage dealer).
+/// * `EventTarget` — the event's OBJECT slot (CR 120.3: the damage recipient,
+///   the "that creature" of "deals damage to a creature, destroy that
+///   creature").
+///
+/// Listed once, in the order a chain that somehow names both should be read:
+/// `TriggeringSource` first, preserving the behaviour that predates
+/// `EventTarget` joining the set.
+///
+/// Consumers must take the whole slice rather than matching one member. Both
+/// are already members of `targeting::is_pure_event_context_filter`, and the
+/// bug class this constant exists to prevent is precisely a pass that handles
+/// one and silently no-ops on the other (issue #4229, Ohran Viper: the delayed
+/// destroy of "that creature at end of combat" was never snapshotted at
+/// creation because the snapshot pass named only `TriggeringSource`).
+pub(crate) const EVENT_SUBJECT_ANAPHORS: [TargetFilter; 2] =
+    [TargetFilter::TriggeringSource, TargetFilter::EventTarget];
+
+/// True if the filter directly or recursively references `anaphor`, one of
+/// [`EVENT_SUBJECT_ANAPHORS`].
 ///
 /// Used by `delayed_trigger::resolve()` to gate the event-context snapshot for
-/// delayed triggers whose inner effect targets the trigger's source object via
-/// the "it" anaphor (e.g. "return it to the battlefield").
+/// delayed triggers whose inner effect names the trigger event's subject or its
+/// object slot via the "it" / "that creature" anaphor (e.g. "return it to the
+/// battlefield", "destroy that creature at end of combat").
 ///
 /// Checks all object-target slots via `effect_parent_ref_slots`, including
 /// hidden slots that `effect_target_filter` does not surface (e.g.,
 /// `Attach.attachment`).
-fn filter_refs_triggering_source(filter: &TargetFilter) -> bool {
+fn filter_refs_event_subject(filter: &TargetFilter, anaphor: &TargetFilter) -> bool {
     match filter {
-        TargetFilter::TriggeringSource => true,
-        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
-            filters.iter().any(filter_refs_triggering_source)
-        }
-        TargetFilter::Not { filter } => filter_refs_triggering_source(filter),
-        _ => false,
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => filters
+            .iter()
+            .any(|inner| filter_refs_event_subject(inner, anaphor)),
+        TargetFilter::Not { filter } => filter_refs_event_subject(filter, anaphor),
+        other => other == anaphor,
     }
 }
 
-fn effect_refs_triggering_source(effect: &Effect) -> bool {
-    effect_parent_ref_slots(effect)
-        .iter()
-        .any(|f| filter_refs_triggering_source(f))
+/// True if the filter directly or recursively references
+/// `TargetFilter::TriggeringSource`.
+fn filter_refs_triggering_source(filter: &TargetFilter) -> bool {
+    filter_refs_event_subject(filter, &TargetFilter::TriggeringSource)
 }
 
-fn ability_refs_triggering_source(ability: &ResolvedAbility) -> bool {
-    effect_refs_triggering_source(&ability.effect)
+fn effect_refs_event_subject(effect: &Effect, anaphor: &TargetFilter) -> bool {
+    effect_parent_ref_slots(effect)
+        .iter()
+        .any(|f| filter_refs_event_subject(f, anaphor))
+}
+
+fn ability_refs_event_subject(ability: &ResolvedAbility, anaphor: &TargetFilter) -> bool {
+    effect_refs_event_subject(&ability.effect, anaphor)
         || ability
             .sub_ability
             .as_deref()
-            .is_some_and(ability_refs_triggering_source)
+            .is_some_and(|sub| ability_refs_event_subject(sub, anaphor))
         || ability
             .else_ability
             .as_deref()
-            .is_some_and(ability_refs_triggering_source)
+            .is_some_and(|alt| ability_refs_event_subject(alt, anaphor))
+}
+
+/// CR 608.2k: Which of the [`EVENT_SUBJECT_ANAPHORS`] this ability chain names,
+/// if any. The delayed-trigger creation snapshot resolves the returned filter
+/// against the CREATION event, so a phase-delayed trigger keeps the object its
+/// creation event named after that event is gone (CR 603.7c).
+pub(crate) fn ability_event_subject_anaphor(
+    ability: &ResolvedAbility,
+) -> Option<&'static TargetFilter> {
+    EVENT_SUBJECT_ANAPHORS
+        .iter()
+        .find(|anaphor| ability_refs_event_subject(ability, anaphor))
+}
+
+fn ability_refs_triggering_source(ability: &ResolvedAbility) -> bool {
+    ability_refs_event_subject(ability, &TargetFilter::TriggeringSource)
 }
 
 /// True when any effect in the ability chain references `ParentTarget`
