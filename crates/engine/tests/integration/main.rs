@@ -376,6 +376,7 @@ mod head_of_the_hunt_token_controller_7086;
 mod heart_shaped_herb_monarch;
 mod heist_production_path_handoff;
 mod hellkite_tyrant_steal_artifacts_2906;
+mod heralds_horn_changeling_chosen_type;
 mod heroic_defiance_recipient_color_4590;
 mod heroic_return_enters_this_way;
 mod heroic_sacrifice_redirect;
