@@ -368,43 +368,7 @@ pub fn resolve(
         // set from drifting: CR 120.1 makes the subject the damage DEALER, so
         // snapshotting `TriggeringSource` for an `EventTarget` chain would
         // destroy the attacking creature instead of the one it damaged.
-        let targets =
-            crate::game::targeting::resolve_event_context_target(state, anaphor, ability.source_id)
-                .map(|t| vec![t])
-                .unwrap_or_default();
-        // CR 400.7 + CR 603.7c: "if that object leaves the battlefield and
-        // returns, it becomes a new object and the ability no longer affects
-        // it." Pin the snapshotted referent to the incarnation it has right now
-        // so an "at end of combat" destroy cannot hit a creature that was
-        // damaged, then blinked or bounced, and came back before the trigger
-        // fired. `live_object_targets` (the list `destroy::resolve` reads once
-        // `targets` is non-empty) drops a stale pin.
-        //
-        // Scoped to the referents the creation event did NOT move — which is
-        // the same operative test `condition_expects_referent_move` applies on
-        // the ParentTarget arm below. A `TriggeringSource` snapshot taken off a
-        // ZoneChanged/Milled event names an object that event just moved, so it
-        // is already a new incarnation at creation and a pin would make it inert
-        // forever (#2883 Grave Betrayal, #2886 Liliana emblem); its guard is the
-        // `ChangeZone.origin` stamp below instead. A `DamageDealt` event moves
-        // nothing, so its recipient is pinnable.
-        let creation_event_moved_this_referent = matches!(anaphor, TargetFilter::TriggeringSource)
-            && triggering_source_destination_zone(state).is_some();
-        let pins = if creation_event_moved_this_referent {
-            Vec::new()
-        } else {
-            targets
-                .iter()
-                .filter_map(|target| match target {
-                    TargetRef::Object(id) => state
-                        .objects
-                        .get(id)
-                        .map(crate::types::identifiers::ObjectIncarnationRef::from_object),
-                    TargetRef::Player(_) => None,
-                })
-                .collect()
-        };
-        (targets, pins)
+        snapshot_event_subject(state, anaphor, ability.source_id)
     } else if super::ability_refs_parent_target(&delayed_ability) {
         let targets = parent_target_snapshot(state, ability);
         let pins =
@@ -478,6 +442,20 @@ pub fn resolve(
 
     delayed_ability.set_target_incarnations_recursive(target_pins);
     delayed_ability.targets = snapshot_targets;
+    // CR 608.2k: Give each clause that names an event-subject anaphor its own
+    // referent, so a chain naming both the event's subject and its object slot
+    // does not hand one clause the other's object.
+    //
+    // MUST run after `set_target_incarnations_recursive` (which overwrites every
+    // node's pins with the root's) and after the root `targets` assignment —
+    // either would otherwise clobber the per-node bindings.
+    //
+    // Gated on the same creation-time-provenance test as the root snapshot:
+    // event-delayed triggers re-resolve their anaphors from the event that
+    // actually fires them and must not be frozen here.
+    if event_subject_anaphor.is_some() {
+        bind_event_subject_nodes(&mut delayed_ability, state, ability.source_id);
+    }
     // CR 603.7c: A delayed triggered ability that refers to information from
     // its creation event keeps that creation-time binding for later resolution.
     delayed_ability.scoped_player = ability.scoped_player;
@@ -547,6 +525,104 @@ pub fn resolve(
     });
 
     Ok(())
+}
+
+/// CR 603.7c + CR 608.2k + CR 400.7: Resolve one event-subject anaphor against
+/// the CREATION event and pin the referent to its current incarnation.
+///
+/// The single authority for both the chain-wide root snapshot and the per-node
+/// rebind below, so the two cannot drift in how they resolve or pin.
+///
+/// The pin implements CR 400.7 / CR 603.7c: "if that object leaves the
+/// battlefield and returns, it becomes a new object and the ability no longer
+/// affects it." Without it an "at end of combat" destroy would still hit a
+/// creature that was damaged, then blinked or bounced, and came back before the
+/// trigger fired. `live_object_targets` — the list `destroy::resolve` reads once
+/// `targets` is non-empty — drops a stale pin.
+///
+/// Pinning is scoped to referents the creation event did NOT move, the same
+/// operative test `condition_expects_referent_move` applies on the ParentTarget
+/// arm. A `TriggeringSource` snapshot taken off a ZoneChanged/Milled event names
+/// an object that event just moved, so it is ALREADY a new incarnation at
+/// creation and a pin would make it inert forever (#2883 Grave Betrayal, #2886
+/// Liliana emblem); its guard is the `ChangeZone.origin` stamp instead. A
+/// `DamageDealt` event moves nothing, so its recipient is pinnable.
+fn snapshot_event_subject(
+    state: &GameState,
+    anaphor: &TargetFilter,
+    source_id: crate::types::identifiers::ObjectId,
+) -> (
+    Vec<TargetRef>,
+    Vec<crate::types::identifiers::ObjectIncarnationRef>,
+) {
+    let targets = crate::game::targeting::resolve_event_context_target(state, anaphor, source_id)
+        .map(|t| vec![t])
+        .unwrap_or_default();
+    let creation_event_moved_this_referent = matches!(anaphor, TargetFilter::TriggeringSource)
+        && triggering_source_destination_zone(state).is_some();
+    let pins = if creation_event_moved_this_referent {
+        Vec::new()
+    } else {
+        targets
+            .iter()
+            .filter_map(|target| match target {
+                TargetRef::Object(id) => state
+                    .objects
+                    .get(id)
+                    .map(crate::types::identifiers::ObjectIncarnationRef::from_object),
+                TargetRef::Player(_) => None,
+            })
+            .collect()
+    };
+    (targets, pins)
+}
+
+/// CR 608.2k + CR 120.1 + CR 120.3: Bind each clause that names an
+/// event-subject anaphor to ITS OWN referent.
+///
+/// `ResolvedAbility::targets` is a single shared slot, and the chain-wide root
+/// snapshot fills it from the FIRST anaphor the chain names. A chain naming
+/// both — the event's subject AND its object slot, e.g. "destroy that creature
+/// and return it" — has two distinct referents (CR 120.1: the subject of an
+/// active-voice damage condition is the DEALER; CR 120.3: its object slot is
+/// the RECIPIENT), so that one shared slot would silently hand one clause the
+/// other's object.
+///
+/// Every node that names an anaphor is bound from its own, unconditionally.
+/// Keying off the node rather than off "differs from the chain-wide pick" is
+/// what makes this correct in BOTH mixed orders: the chain-wide pick is
+/// whichever anaphor comes first in [`EVENT_SUBJECT_ANAPHORS`], not whichever
+/// the root clause happens to use, so a root naming `EventTarget` under a sub
+/// naming `TriggeringSource` would otherwise keep the dealer.
+///
+/// This is safe precisely because propagation is gated on emptiness:
+/// `effects::can_inherit_parent_targets` inherits a parent's targets only when
+/// `sub.targets.is_empty()`, so a node given its own binding here keeps it.
+///
+/// Single-anaphor chains — the entire shipped corpus — are unaffected: a node
+/// resolves to the same object it would have inherited. Nodes naming NO
+/// event-subject anaphor (`ParentTarget`, typed pools) are left untouched,
+/// because giving them targets would BLOCK the inheritance they rely on; so is
+/// a node whose anaphor resolves to nothing, which falls back to inheritance
+/// exactly as before.
+fn bind_event_subject_nodes(
+    ability: &mut ResolvedAbility,
+    state: &GameState,
+    source_id: crate::types::identifiers::ObjectId,
+) {
+    if let Some(node_anaphor) = super::effect_event_subject_anaphor(&ability.effect) {
+        let (targets, pins) = snapshot_event_subject(state, node_anaphor, source_id);
+        if !targets.is_empty() {
+            ability.targets = targets;
+            ability.target_incarnations = pins;
+        }
+    }
+    if let Some(sub) = ability.sub_ability.as_deref_mut() {
+        bind_event_subject_nodes(sub, state, source_id);
+    }
+    if let Some(alt) = ability.else_ability.as_deref_mut() {
+        bind_event_subject_nodes(alt, state, source_id);
+    }
 }
 
 /// CR 603.7c: Only phase-delayed triggers lose their event subject between
